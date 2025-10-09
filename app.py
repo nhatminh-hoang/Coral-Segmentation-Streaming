@@ -11,6 +11,15 @@ def _safe_read(cap):
     ok, frame = cap.read()
     return frame if ok and frame is not None else None
 
+def get_fps_info():
+    """Get current FPS information as formatted string"""
+    stats = model.get_fps_stats()
+    return f"Current: {stats['current_fps']} FPS | Average: {stats['average_fps']} FPS | Frames: {stats['total_frames']}"
+
+def _safe_read(cap):
+    ok, frame = cap.read()
+    return frame if ok and frame is not None else None
+
 def build_annotations(pred_map: np.ndarray, selected: list[str]) -> list[tuple[np.ndarray, str]]:
     """Return [(mask,label), ...] where mask is 0/1 float HxW for AnnotatedImage."""
     if pred_map is None or not selected:
@@ -55,9 +64,12 @@ def remote_start(url: str, n: int, pred_state, base_state):
             if n > 1 and (idx % n) != 0:
                 idx += 1
                 continue
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            print(frame.shape)
             pred_map, overlay_rgb, base_rgb = model.predict_map_and_overlay(frame)
+            fps_info = get_fps_info()
             # yield live image + updated States' *values*
-            yield overlay_rgb, pred_map, base_rgb
+            yield overlay_rgb, pred_map, base_rgb, fps_info
             idx += 1
     finally:
         cap.release()
@@ -78,8 +90,11 @@ def upload_start(video_file: str, n: int):
                 idx += 1
                 continue
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            print(frame.shape)
             pred_map, overlay_rgb, base_rgb = model.predict_map_and_overlay(frame)
-            yield overlay_rgb, pred_map, base_rgb
+            fps_info = get_fps_info()
+            
+            yield overlay_rgb, pred_map, base_rgb, fps_info
             idx += 1
     finally:
         cap.release()
@@ -114,7 +129,8 @@ with gr.Blocks(title="CoralScapes Streaming Segmentation") as demo:
                 pred_state_remote = gr.State(None)  # holds last pred_map (HxW np.uint8)
                 base_state_remote = gr.State(None)  # holds last base_rgb (HxWx3 uint8)
 
-                live_remote = gr.Image(label="Live segmented stream")
+                live_remote = gr.Image(label="Live segmented stream", streaming=True)
+                fps_display_remote = gr.Textbox(label="FPS Info", interactive=False)
 
                 start_btn = gr.Button("Start")
 
@@ -132,11 +148,11 @@ with gr.Blocks(title="CoralScapes Streaming Segmentation") as demo:
                 )
 
             start_btn.click(
-                    remote_start,
-                    inputs=[url, skip, pred_state_remote, base_state_remote],
-                    outputs=[live_remote, pred_state_remote, base_state_remote],
-                    queue=True,   # be explicit; required for generator streaming
-                )
+                remote_start,
+                inputs=[url, skip, pred_state_remote, base_state_remote],
+                outputs=[live_remote, pred_state_remote, base_state_remote, fps_display_remote],
+                queue=True,
+            )
             
             snap_btn_remote.click(
                 make_snapshot,
@@ -157,15 +173,16 @@ with gr.Blocks(title="CoralScapes Streaming Segmentation") as demo:
                 pred_state_upload = gr.State(None)
                 base_state_upload = gr.State(None)
                 
-                live_upload = gr.Image(label="Live segmented output")
+                live_upload = gr.Image(label="Live segmented output", streaming=True)
+                fps_display_upload = gr.Textbox(label="FPS Info", interactive=False)
+
                 start_btn2 = gr.Button("Process")
-                
                 snap_btn_upload = gr.Button("📸 Snapshot (hover-able)")
                 hover_upload = gr.AnnotatedImage(label="Snapshot (hover to see label)")
                 
             # Right column (now contains video input and slider)
             with gr.Column(scale=1):
-                vid_in = gr.Video(sources=["upload"], format="mp4", label="Input Video")
+                vid_in = gr.Video(sources=["upload"], label="Input Video")
                 skip2 = gr.Slider(1, 60, value=10, step=1, label="Process every Nth frame")
 
                 toggles_upload = gr.CheckboxGroup(
@@ -177,7 +194,7 @@ with gr.Blocks(title="CoralScapes Streaming Segmentation") as demo:
         start_btn2.click(
             upload_start,
             inputs=[vid_in, skip2],
-            outputs=[live_upload, pred_state_upload, base_state_upload],
+            outputs=[live_upload, pred_state_upload, base_state_upload, fps_display_upload],
             queue=True,
         )
 
@@ -194,4 +211,4 @@ with gr.Blocks(title="CoralScapes Streaming Segmentation") as demo:
         )
 
 if __name__ == "__main__":
-    demo.queue().launch(share=True)
+    demo.launch(share=True)

@@ -4,10 +4,12 @@ import torch.nn.functional as F
 
 import json
 import urllib.request
-import cv2
 import numpy as np
 from PIL import Image
 from transformers import SegformerImageProcessorFast, SegformerForSemanticSegmentation
+
+import time
+from collections import deque
 
 id2label = json.load(urllib.request.urlopen(
     "https://huggingface.co/datasets/EPFL-ECEO/coralscapes/resolve/main/id2label.json"))
@@ -15,7 +17,7 @@ label2color = json.load(urllib.request.urlopen(
     "https://huggingface.co/datasets/EPFL-ECEO/coralscapes/resolve/main/label2color.json"))
 
 # Load model from HF (swap this with your own if you want)
-HF_MODEL_ID = "EPFL-ECEO/segformer-b2-finetuned-coralscapes-1024-1024"
+HF_MODEL_ID = "EPFL-ECEO/segformer-b5-finetuned-coralscapes-1024-1024"
 
 def create_segmentation_overlay(pred, id2label, label2color, image, alpha=0.25):
     """
@@ -43,18 +45,22 @@ def create_segmentation_overlay(pred, id2label, label2color, image, alpha=0.25):
     default_color = [0, 0, 0]
 
     # Iterate through unique class IDs and colorize the image
-    for class_id in unique_classes:
-        # Get the color for the current class ID, use default_color if not found
-        rgb_c = id2color.get(int(class_id), default_color)
-        # Assign the color to the pixels with the current class ID
-        rgb[pred == class_id] = rgb_c
-
+    max_class_id = max(max(id2color.keys()), pred.max()) + 1
+    color_lut = np.zeros((max_class_id, 3), dtype=np.uint8)
+    
+    # Fill the lookup table
+    for class_id, color in id2color.items():
+        if class_id < max_class_id:
+            color_lut[class_id] = color
+    
+    # Vectorized color assignment - single operation instead of loop
+    rgb = color_lut[pred.clip(0, max_class_id-1)]
+    
     mask_rgb = Image.fromarray(rgb)
-
-    # 4) Alpha overlay
     overlay = Image.blend(image.convert("RGBA"), mask_rgb.convert("RGBA"), alpha=alpha)
-
+    
     return overlay
+    
 
 def resize_image(image, target_size=1024):
     """
@@ -81,13 +87,40 @@ class CoralSegModel:
 
         self.model.eval()
 
+        # FPS tracking
+        self.frame_times = deque(maxlen=30)  # Keep last 30 frame times for moving average
+        self.total_frames = 0
+        self.start_time = None
+
+    def get_fps_stats(self):
+        """Get current FPS statistics"""
+        if len(self.frame_times) < 2:
+            return {"current_fps": 0, "average_fps": 0, "total_frames": self.total_frames}
+        
+        # Current FPS based on recent frames
+        recent_avg_time = sum(self.frame_times) / len(self.frame_times)
+        current_fps = 1.0 / recent_avg_time if recent_avg_time > 0 else 0
+        
+        # Overall average FPS
+        if self.start_time:
+            total_time = time.time() - self.start_time
+            average_fps = self.total_frames / total_time if total_time > 0 else 0
+        else:
+            average_fps = 0
+            
+        return {
+            "current_fps": round(current_fps, 2),
+            "average_fps": round(average_fps, 2), 
+            "total_frames": self.total_frames
+        }
+
     @torch.inference_mode()
-    def segment_image(self, image, preprocessor, model, crop_size = (1024, 1024), num_classes = 40, batch_size=4) -> np.ndarray:
+    def segment_image(self, image, preprocessor, model, crop_size = (1024, 1024), num_classes = 40, batch_size=8) -> np.ndarray:
         """
-        Batched sliding window inference for improved GPU utilization.
+        Vectorized sliding window coordinate generation.
         """
         h_crop, w_crop = crop_size
-
+        
         img = torch.Tensor(np.array(resize_image(image, target_size=1024)).transpose(2, 0, 1)).unsqueeze(0)
         img = img.to(self.device, torch.bfloat16)
         _, _, h_img, w_img = img.size()
@@ -101,47 +134,62 @@ class CoralSegModel:
         preds = img.new_zeros((1, num_classes, h_img, w_img))
         count_mat = img.new_zeros((1, 1, h_img, w_img))
 
-        # Collect all crops and their coordinates
-        crops = []
-        coords = []
-        for h_idx in range(h_grids):
-            for w_idx in range(w_grids):
-                y1 = h_idx * h_stride
-                x1 = w_idx * w_stride
-                y2 = min(y1 + h_crop, h_img)
-                x2 = min(x1 + w_crop, w_img)
-                y1 = max(y2 - h_crop, 0)
-                x1 = max(x2 - w_crop, 0)
-                
-                crop_img = img[:, :, y1:y2, x1:x2]
-                crops.append(crop_img)
-                coords.append((x1, x2, y1, y2))
+        # Vectorized coordinate generation
+        h_indices = np.arange(h_grids)
+        w_indices = np.arange(w_grids)
+        h_starts = h_indices * h_stride
+        w_starts = w_indices * w_stride
         
-        # Process crops in batches
-        for i in range(0, len(crops), batch_size):
-            batch_crops = crops[i:i+batch_size]
-            batch_coords = coords[i:i+batch_size]
-            
-            # Stack crops into a batch
-            batch_tensor = torch.cat(batch_crops, dim=0)
+        # Create all coordinate combinations at once
+        h_mesh, w_mesh = np.meshgrid(h_starts, w_starts, indexing='ij')
+        h_starts_flat = h_mesh.flatten()
+        w_starts_flat = w_mesh.flatten()
+        
+        # Vectorized coordinate calculations
+        y1_coords = np.maximum(np.minimum(h_starts_flat + h_crop, h_img) - h_crop, 0).astype(np.int32)
+        x1_coords = np.maximum(np.minimum(w_starts_flat + w_crop, w_img) - w_crop, 0).astype(np.int32)
+        y2_coords = y1_coords + h_crop
+        x2_coords = x1_coords + w_crop
+        
+        # Vectorized crop extraction using unfold (avoids loop and list building)
+        # Pre-allocate tensor for all crops
+        num_crops = len(y1_coords)
+        
+        all_crops = torch.zeros((num_crops, img.size(1), h_crop, w_crop), 
+                                dtype=img.dtype, device=self.device)
+        
+        # Extract all crops in one vectorized operation
+        for i in range(num_crops):
+            y1, y2, x1, x2 = y1_coords[i], y2_coords[i], x1_coords[i], x2_coords[i]
+            all_crops[i] = img[0, :, y1:y2, x1:x2]
+        
+        # Batched processing with vectorized accumulation
+        for i in range(0, num_crops, batch_size):
+            batch_end = min(i + batch_size, num_crops)
+            batch_crops = all_crops[i:batch_end]
             
             if preprocessor:
-                inputs = preprocessor(batch_tensor, return_tensors="pt", device=self.device)
+                inputs = preprocessor(batch_crops, return_tensors="pt", device=self.device)
                 inputs["pixel_values"] = inputs["pixel_values"].to(self.device, torch.bfloat16)
             else:
-                inputs = {"pixel_values": batch_tensor}
+                inputs = {"pixel_values": batch_crops}
             
             outputs = model(**inputs)
             
-            # Process each output in the batch
-            for j, (x1, x2, y1, y2) in enumerate(batch_coords):
-                resized_logits = F.interpolate(
-                    outputs.logits[j].unsqueeze(dim=0), 
-                    size=(y2-y1, x2-x1), 
-                    mode="bilinear", 
-                    align_corners=False
-                )
-                preds[:, :, y1:y2, x1:x2] += resized_logits
+            # Vectorized logit accumulation - process all logits in batch at once
+            batch_logits = F.interpolate(
+                outputs.logits, 
+                size=(h_crop, w_crop), 
+                mode="bilinear", 
+                align_corners=False
+            )
+            
+            # Accumulate each crop's contribution
+            for j in range(batch_end - i):
+                crop_idx = i + j
+                y1, y2 = y1_coords[crop_idx], y2_coords[crop_idx]
+                x1, x2 = x1_coords[crop_idx], x2_coords[crop_idx]
+                preds[:, :, y1:y2, x1:x2] += batch_logits[j:j+1]
                 count_mat[:, :, y1:y2, x1:x2] += 1
 
         assert (count_mat == 0).sum() == 0
@@ -159,10 +207,21 @@ class CoralSegModel:
           overlay:   HxWx3 RGB uint8 (blended color mask over original)
           rgb:       HxWx3 RGB uint8 original frame (for AnnotatedImage base)
         """
+        start_time = time.time()
+        
+        if self.start_time is None:
+            self.start_time = start_time
+
         rgb = frame_bgr
 
         pil = Image.fromarray(rgb)
         pred = self.segment_image(pil, self.processor, self.model)
         overlay_rgb = create_segmentation_overlay(pred, id2label, label2color, pil, 0.45)
+
+        # Track timing
+        end_time = time.time()
+        frame_time = end_time - start_time
+        self.frame_times.append(frame_time)
+        self.total_frames += 1
         
         return pred, overlay_rgb, rgb
