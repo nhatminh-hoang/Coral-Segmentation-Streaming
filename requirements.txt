@@ -6,3 +6,5 @@ opencv-python-headless
 numpy
 Pillow
 huggingface-hub
+ngrok
+onnxruntime-gpu
