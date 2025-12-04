@@ -1,5 +1,4 @@
 import os
-os.environ["HF_HUB_OFFLINE"] = "1"
 
 import torch
 import torch.nn.functional as F
@@ -208,6 +207,8 @@ class CoralSegModel:
             self._use_iobinding = False
             self.model = None
 
+            print(f"ONNX Runtime session created with providers: {self.onnx_session.get_providers()}")
+
         else:
             # Load PyTorch model
             self.model = SegformerForSemanticSegmentation.from_pretrained(
@@ -329,7 +330,7 @@ class CoralSegModel:
         rgb = frame_bgr
 
         pil = Image.fromarray(rgb)
-        pred = self.segment_image(pil, target_size=380)
+        pred = self.segment_image(pil, target_size=480)
         overlay_rgb = create_segmentation_overlay(pred, pil, 0.45)
 
         # Track timing

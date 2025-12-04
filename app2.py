@@ -1,16 +1,24 @@
+# app.py
 import os
-
-from PIL import Image, ImageDraw, ImageFont
-import cv2
-import numpy as np
-import gradio as gr
+from io import BytesIO
 from pathlib import Path
 import time as time_module
+from typing import List, Optional
 
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+import gradio as gr
+from fastapi import FastAPI, File, UploadFile, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, RedirectResponse
+
+# ===== your existing imports / model wrappers =====
 from inference import CoralSegModel, id2label, label2color, label2vietnamese
 
 # ==============================
-# CONFIG & MODEL
+# CONFIG & MODEL (unchanged)
 # ==============================
 VIDEO_DIR = Path("sample_videos")  # auto-scan this folder
 ALLOWED_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
@@ -33,16 +41,16 @@ for id_str, en_label in id2label.items():
         color_map[label2vietnamese[en_label]] = hex_color
 
 # ==============================
-# HELPERS
+# HELPERS (unchanged)
 # ==============================
 CORAL_KEYWORDS = {
-    "coral",            # catches 'other coral alive/dead/bleached'
+    "coral",
     "branching",
     "massive", "meandering",
     "acropora", "table acropora",
     "pocillopora",
     "stylophora",
-    "millepora",        # hydrocoral included in Coralscapes taxonomy
+    "millepora",
 }
 
 def _is_coral_label(en_label: str) -> bool:
@@ -50,13 +58,11 @@ def _is_coral_label(en_label: str) -> bool:
     return any(k in s for k in CORAL_KEYWORDS)
 
 def _all_label_choices(language: str) -> list[str]:
-    """All labels shown in UI, translated if needed."""
     if language == "Tiếng Việt":
         return [label2vietnamese.get(lbl, lbl) for lbl in id2label.values()]
     return list(id2label.values())
 
 def _coral_default_values(language: str) -> list[str]:
-    """Subset of choices that start enabled (coral only), translated."""
     coral_en = [lbl for lbl in id2label.values() if _is_coral_label(lbl)]
     if language == "Tiếng Việt":
         return [label2vietnamese.get(lbl, lbl) for lbl in coral_en]
@@ -76,7 +82,6 @@ def _safe_read(cap):
     return frame if ok and frame is not None else None
 
 def get_label(label_en: str, language="English"):
-    """Map English label to selected language (Vietnamese if available)."""
     if language == "Tiếng Việt" and label_en in label2vietnamese:
         return label2vietnamese[label_en]
     return label_en
@@ -88,14 +93,9 @@ def _load_font(size=40):
         return ImageFont.load_default()
 
 def build_annotations(pred_map: np.ndarray, selected: list[str], language="English"):
-    """
-    Return [(mask,label), ...] where mask is float32 0..1 HxW for gr.AnnotatedImage.
-    Works with both English and Vietnamese label names in `selected`.
-    """
     if pred_map is None or not selected:
         return []
 
-    # English/Vietnamese -> class_id
     label2id_en = {label: int(id_str) for id_str, label in id2label.items()}
     vietnamese2id = {
         label2vietnamese[en]: int(id_str)
@@ -115,7 +115,6 @@ def build_annotations(pred_map: np.ndarray, selected: list[str], language="Engli
             original_en = label_name
         elif label_name in vietnamese2id:
             class_id = vietnamese2id[label_name]
-            # recover English name for consistent display mapping
             for en_label, vn_label in label2vietnamese.items():
                 if vn_label == label_name:
                     original_en = en_label
@@ -134,7 +133,6 @@ def build_annotations(pred_map: np.ndarray, selected: list[str], language="Engli
 
         display_label = get_label(original_en, language)
 
-        # put label at centroid of the largest contour (if present)
         if contours:
             largest = max(contours, key=cv2.contourArea)
             M = cv2.moments(largest)
@@ -147,7 +145,7 @@ def build_annotations(pred_map: np.ndarray, selected: list[str], language="Engli
                 bbox = draw.textbbox((0, 0), display_label, font=font, align="center")
                 tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 box = [cX - tw // 2 - 5, cY - th // 2 - 5, cX + tw // 2 + 5, cY + th // 2 + 5]
-                draw.rectangle(box, fill=255)  # white backing box
+                draw.rectangle(box, fill=255)
                 draw.text((cX - tw // 2, cY - th // 1.5), display_label, fill=0, font=font, align="center")
                 boundary_mask = (np.array(pil_img) / 255.0).astype(np.float32)
 
@@ -156,28 +154,19 @@ def build_annotations(pred_map: np.ndarray, selected: list[str], language="Engli
     return anns
 
 def get_fps_info():
-    """Get current FPS information as formatted string."""
     stats = model.get_fps_stats()
     return f"Current: {stats['current_fps']} FPS | Average: {stats['average_fps']} FPS"
 
 # ==============================
-# STREAMING: AUTO PROCESS FOLDER
+# STREAMING: AUTO PROCESS FOLDER (unchanged)
 # ==============================
 def auto_process_folder(skip: int):
-    """
-    Infinite generator:
-      - Rescans VIDEO_DIR each pass
-      - Streams frames for every video found
-      - If no videos, yields a status message and waits briefly
-    Yields: overlay_rgb, pred_map, base_rgb, fps_info
-    """
     try:
         while True:
             model.reset_fps_stats()
             files = list_video_files(VIDEO_DIR)
 
             if not files:
-                # keep the stream alive while waiting for files to appear
                 yield None, None, None, "No videos found in ./sample_videos"
                 time_module.sleep(2.0)
                 continue
@@ -185,7 +174,6 @@ def auto_process_folder(skip: int):
             for path in files:
                 cap = cv2.VideoCapture(str(path))
                 if not cap.isOpened():
-                    # surface the issue in the FPS box but keep going
                     yield None, None, None, f"Cannot open: {path.name}"
                     continue
 
@@ -207,20 +195,17 @@ def auto_process_folder(skip: int):
                 finally:
                     cap.release()
 
-            # small pause before rescanning the folder again
             time_module.sleep(1.0)
 
     except GeneratorExit:
-        # Session ended; tidy exit
         return
 
 # ==============================
-# SNAPSHOT / TOGGLES
+# SNAPSHOT / TOGGLES (unchanged)
 # ==============================
 def make_snapshot(selected_labels, pred_map, base_rgb, language="English", alpha=0.25):
     if pred_map is None or base_rgb is None:
         return gr.update()
-    # normalize selected label names to match the chosen display language
     if language == "Tiếng Việt":
         selected_labels = [label2vietnamese.get(label, label) for label in selected_labels]
     else:
@@ -233,23 +218,22 @@ def make_snapshot(selected_labels, pred_map, base_rgb, language="English", alpha
 
 def update_toggles_lang(lang):
     return gr.CheckboxGroup(
-        choices=_all_label_choices(lang),           # show everything
-        value=_coral_default_values(lang)           # enable coral only
+        choices=_all_label_choices(lang),
+        value=_coral_default_values(lang)
     )
 
 def toggle_options(open_state: bool):
     new_state = not bool(open_state)
-    # Return updated state + make the whole group visible/hidden
-    return new_state, gr.Group(visible=new_state)  # update container visibility (recommended pattern)
+    return new_state, gr.Group(visible=new_state)
 
 # ==============================
-# UI
+# UI (unchanged)
 # ==============================
 with gr.Blocks(title="CoralScapes Auto Segmentation") as demo:
     with gr.Row():
         with gr.Column(scale=3):
-            pred_state = gr.State(None)  # last pred_map (HxW np.uint8)
-            base_state = gr.State(None)  # last base_rgb (HxWx3 uint8)
+            pred_state = gr.State(None)
+            base_state = gr.State(None)
 
             live_img   = gr.Image(label="Live segmented output", streaming=True)
             fps_box    = gr.Textbox(label="FPS Info", interactive=False)
@@ -258,18 +242,16 @@ with gr.Blocks(title="CoralScapes Auto Segmentation") as demo:
             hover_img  = gr.AnnotatedImage(label="Snapshot (hover to see label)", color_map=color_map)
 
         with gr.Column(scale=1):
-            # -- NEW: Options toggle button + hidden container
             options_open = gr.State(False)
-            options_btn = gr.Button("⚙️ Tuỳ chọn", size="sm")  # "Options" in Vietnamese
+            options_btn = gr.Button("⚙️ Tuỳ chọn", size="sm")
 
             with gr.Group(visible=False) as options_panel:
                 skip = gr.Slider(1, 60, value=DEFAULT_SKIP, step=1, label="Xử lý mỗi N khung hình")
                 language = gr.Radio(
                     choices=["English", "Tiếng Việt"],
-                    value="Tiếng Việt",  # default to Vietnamese
+                    value="Tiếng Việt",
                     label="Ngôn ngữ hiển thị / Display Language"
                 )
-                # Show all labels, but only coral are checked initially
                 vi_choices_all = _all_label_choices("Tiếng Việt")
                 vi_coral_default = _coral_default_values("Tiếng Việt")
                 toggles = gr.CheckboxGroup(
@@ -277,14 +259,12 @@ with gr.Blocks(title="CoralScapes Auto Segmentation") as demo:
                     label="Bật/tắt các lớp trong ảnh chụp",
                 )
 
-            # Toggle button wiring
             options_btn.click(
                 toggle_options,
                 inputs=[options_open],
                 outputs=[options_open, options_panel],
             )
 
-    # Start automatically when the app loads (infinite streamer).
     demo.load(
         auto_process_folder,
         inputs=[skip],
@@ -292,14 +272,63 @@ with gr.Blocks(title="CoralScapes Auto Segmentation") as demo:
         queue=True,
     )
 
-    # Keep toggles synced with language
     language.change(update_toggles_lang, inputs=[language], outputs=[toggles])
-
-    # Snapshot wiring
     snap_btn.click(make_snapshot, inputs=[toggles, pred_state, base_state, language], outputs=[hover_img])
     toggles.change(make_snapshot, inputs=[toggles, pred_state, base_state, language], outputs=[hover_img])
     language.change(make_snapshot, inputs=[toggles, pred_state, base_state, language], outputs=[hover_img])
 
-if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=10, max_size=40)
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+# Enable Gradio queue before mounting
+demo.queue(default_concurrency_limit=10, max_size=40)
+
+# ==============================
+# FASTAPI APP (new)
+# ==============================
+app = FastAPI(title="CoralScapes Segmentation Service")
+
+# CORS so others on LAN can access (e.g., http://10.20.8.10:7860)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # narrow if needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
+    # Redirect to the mounted Gradio UI
+    return RedirectResponse(url="/app")
+
+# --- Simple inference API: POST an image, get PNG overlay back ---
+@app.post("/api/process_image")
+async def process_image(file: UploadFile = File(...)):
+    data = await file.read()
+    img = Image.open(BytesIO(data)).convert("RGB")
+    frame = np.array(img)
+    pred_map, overlay_rgb, base_rgb = model.predict_map_and_overlay(frame)
+
+    # Return overlay RGB as PNG bytes
+    out = BytesIO()
+    Image.fromarray(overlay_rgb).save(out, format="PNG")
+    out.seek(0)
+    return StreamingResponse(out, media_type="image/png")
+
+# (Optional) list available local videos
+@app.get("/api/videos")
+def list_videos():
+    files = [p.name for p in list_video_files(VIDEO_DIR)]
+    return {"videos": files}
+
+# ==============================
+# MOUNT GRADIO UNDER /app
+# ==============================
+# Official pattern: mount Blocks onto FastAPI
+# Docs: https://www.gradio.app/docs/gradio/mount_gradio_app
+app = gr.mount_gradio_app(app, demo, path="/app")
+
+# If running as a script: `uvicorn app:app --host 0.0.0.0 --port 7860`
+# (Do not call demo.launch(); FastAPI + uvicorn serve the whole app.)
