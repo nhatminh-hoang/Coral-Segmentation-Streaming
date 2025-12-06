@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CoralScapes Production Monitor</title>
+    <meta name="description" content="Real-time coral reef segmentation streaming monitor">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Header Bar -->
+        <header class="header">
+            <div class="header-left">
+                <h1 class="logo">🪸 CoralScapes Monitor</h1>
+                <span class="connection-status" id="connection-status">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Connecting...</span>
+                </span>
+            </div>
+            <div class="header-right">
+                <div class="fps-display" id="fps-display">
+                    <span class="fps-label">FPS:</span>
+                    <span class="fps-value" id="fps-value">--</span>
+                </div>
+                <button class="settings-btn" id="settings-btn" title="Settings">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path
+                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                        </path>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Streaming Display -->
+            <section class="stream-section" id="stream-section">
+                <div class="section-header">
+                    <h2>🎬 Live Segmentation</h2>
+                    <button class="fullscreen-btn" id="stream-fullscreen-btn" title="Toggle Fullscreen">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path
+                                d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3">
+                            </path>
+                        </svg>
+                    </button>
+                </div>
+                <div class="stream-container">
+                    <img id="stream-image" class="stream-image" src="" alt="Segmentation Stream">
+                    <div class="stream-overlay" id="stream-overlay">
+                        <div class="stream-placeholder">
+                            <div class="spinner"></div>
+                            <p>Waiting for video stream...</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Side Panel - Stats Only -->
+            <aside class="right-panel" id="right-panel">
+                <!-- Statistics Chart -->
+                <div class="stats-section">
+                    <div class="stats-header">
+                        <h2>📊 Statistics</h2>
+                        <div class="stats-header-controls">
+                            <div class="period-selector">
+                                <button class="period-btn active" data-period="day">Day</button>
+                                <button class="period-btn" data-period="week">Week</button>
+                                <button class="period-btn" data-period="month">Month</button>
+                                <button class="period-btn" data-period="3month">3M</button>
+                                <button class="period-btn" data-period="6month">6M</button>
+                            </div>
+                            <button class="fullscreen-btn" id="stats-fullscreen-btn" title="Toggle Fullscreen">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <path
+                                        d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3">
+                                    </path>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="stats-chart"></canvas>
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- Settings Panel (Slide-in) -->
+        <aside class="settings-panel" id="settings-panel">
+            <div class="panel-header">
+                <h2>⚙️ Settings</h2>
+                <button class="close-btn" id="close-settings">×</button>
+            </div>
+            <div class="panel-content">
+                <!-- Camera URL Input -->
+                <div class="setting-group">
+                    <label for="camera-url">Camera/Stream URL</label>
+                    <input type="text" id="camera-url" class="text-input" placeholder="rtsp://... or http://...">
+                    <button class="apply-btn" id="apply-camera-url">Apply</button>
+                </div>
+                <div class="setting-group">
+                    <label for="skip-slider">Frame Skip (process every N frames)</label>
+                    <div class="slider-container">
+                        <input type="range" id="skip-slider" min="1" max="10" value="3">
+                        <span class="slider-value" id="skip-value">3</span>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Language / Ngôn ngữ</label>
+                    <div class="radio-group">
+                        <label class="radio-label">
+                            <input type="radio" name="language" value="English">
+                            <span>English</span>
+                        </label>
+                        <label class="radio-label">
+                            <input type="radio" name="language" value="Tiếng Việt" checked>
+                            <span>Tiếng Việt</span>
+                        </label>
+                    </div>
+                </div>
+                <!-- Label Toggles -->
+                <div class="setting-group labels-setting">
+                    <div class="labels-header">
+                        <label>🏷️ Label Filters</label>
+                        <div class="label-actions">
+                            <button class="label-action-btn" id="select-all">All</button>
+                            <button class="label-action-btn" id="select-none">None</button>
+                            <button class="label-action-btn" id="select-coral">Coral</button>
+                        </div>
+                    </div>
+                    <div class="labels-grid" id="labels-grid">
+                        <!-- Labels will be populated by JavaScript -->
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Settings Overlay -->
+        <div class="settings-overlay" id="settings-overlay"></div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

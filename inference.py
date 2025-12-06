@@ -210,10 +210,10 @@ class CoralSegModel:
             print(f"ONNX Runtime session created with providers: {self.onnx_session.get_providers()}")
 
         else:
-            # Load PyTorch model
+            # Load PyTorch model with bfloat16 for faster inference
             self.model = SegformerForSemanticSegmentation.from_pretrained(
                 HF_MODEL_ID,
-                dtype=torch.bfloat16
+                torch_dtype=torch.bfloat16
             ).to(self.device)
             self.model.eval()
             self.onnx_session = None
@@ -307,7 +307,8 @@ class CoralSegModel:
                 do_rescale=True,
                 do_normalize=True,
             )
-            pixel_values = inputs["pixel_values"].to(self.device)
+            # Convert to bfloat16 to match model dtype for faster inference
+            pixel_values = inputs["pixel_values"].to(self.device, dtype=torch.bfloat16)
             outputs = self.model(pixel_values=pixel_values)
             logits = outputs.logits  # [1, C, h, w]
             preds = logits.argmax(dim=1)[0].to("cpu").numpy().astype(np.uint8)

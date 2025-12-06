@@ -2,4 +2,6 @@
 source ~/miniconda3/bin/activate
 conda activate coral_streaming
 
-uvicorn app2:app --host 0.0.0.0 --port 7860
+echo "Starting CoralScapes Production Monitor..."
+echo "Server will be available at http://0.0.0.0:7860"
+python server.py
