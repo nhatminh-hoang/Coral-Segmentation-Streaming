@@ -62,20 +62,110 @@ def _safe_read(cap):
     ok, frame = cap.read()
     return frame if ok and frame is not None else None
 
-def load_label_stats() -> Dict[str, Any]:
-    """Load label statistics from JSON file"""
-    stats_file = DATA_DIR / "label_stats.json"
-    if stats_file.exists():
-        with open(stats_file, "r") as f:
-            return json.load(f)
-    return {}
+# ==============================
+# TIME-SERIES DATA STORAGE
+# ==============================
+from datetime import datetime, timedelta
 
-def save_label_stats(stats: Dict[str, Any]):
-    """Save label statistics to JSON file"""
-    stats_file = DATA_DIR / "label_stats.json"
+STATS_FILE = DATA_DIR / "label_stats.json"
+SAVE_INTERVAL_FRAMES = 30  # Save stats every N processed frames
+
+def load_time_series() -> Dict[str, Any]:
+    """Load time-series statistics from JSON file"""
+    if STATS_FILE.exists():
+        with open(STATS_FILE, "r") as f:
+            data = json.load(f)
+            # Handle legacy format - convert if needed
+            if "time_series" not in data:
+                return {"time_series": []}
+            return data
+    return {"time_series": []}
+
+def save_time_series(data: Dict[str, Any]):
+    """Save time-series statistics to JSON file"""
     DATA_DIR.mkdir(exist_ok=True)
-    with open(stats_file, "w") as f:
-        json.dump(stats, f, indent=2)
+    with open(STATS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def append_frame_stats(label_stats: Dict[str, int]):
+    """Append current frame stats with timestamp to time-series data"""
+    if not label_stats:
+        return
+    
+    data = load_time_series()
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "labels": dict(label_stats)
+    }
+    data["time_series"].append(entry)
+    
+    # Optional: Prune old data (older than 6 months)
+    cutoff = datetime.now() - timedelta(days=180)
+    data["time_series"] = [
+        e for e in data["time_series"]
+        if datetime.fromisoformat(e["timestamp"]) > cutoff
+    ]
+    
+    save_time_series(data)
+
+def compute_period_mean(period: str) -> Dict[str, Any]:
+    """
+    Calculate mean pixel area per label for a given time period.
+    
+    Args:
+        period: One of 'day', 'week', 'month', '3month', '6month'
+    
+    Returns:
+        Dict with 'labels', 'values' (mean pixel areas), 'period', 'sample_count'
+    """
+    period_days = {
+        "day": 1,
+        "week": 7,
+        "month": 30,
+        "3month": 90,
+        "6month": 180
+    }
+    
+    days = period_days.get(period, 1)
+    cutoff = datetime.now() - timedelta(days=days)
+    
+    data = load_time_series()
+    time_series = data.get("time_series", [])
+    
+    # Filter by time period
+    filtered = []
+    for entry in time_series:
+        try:
+            entry_time = datetime.fromisoformat(entry["timestamp"])
+            if entry_time > cutoff:
+                filtered.append(entry)
+        except (ValueError, KeyError):
+            continue
+    
+    if not filtered:
+        return {"labels": [], "values": [], "period": period, "sample_count": 0}
+    
+    # Aggregate: compute mean per label
+    label_totals: Dict[str, List[int]] = defaultdict(list)
+    for entry in filtered:
+        for label, count in entry.get("labels", {}).items():
+            label_totals[label].append(count)
+    
+    # Compute means
+    labels = []
+    values = []
+    for label, counts in sorted(label_totals.items(), key=lambda x: sum(x[1])/len(x[1]), reverse=True):
+        mean_val = sum(counts) / len(counts)
+        labels.append(label)
+        values.append(round(mean_val, 2))
+    
+    return {
+        "labels": labels,
+        "values": values,
+        "period": period,
+        "sample_count": len(filtered),
+        "unit": "mean_pixels"
+    }
 
 # Build color map
 color_map = {}
@@ -125,6 +215,7 @@ class StreamState:
         self.frame_stats: Dict[str, int] = defaultdict(int)  # Current frame label counts
         self.camera_url: Optional[str] = None  # Camera/stream URL (None = use sample videos)
         self.source_changed: bool = False  # Flag to signal source change to processor
+        self.processed_frames: int = 0  # Counter for periodic stats saving
     
     def toggle_label(self, label: str) -> bool:
         """Toggle a label on/off. Returns new state."""
@@ -152,6 +243,11 @@ class StreamState:
                 if str_id in id2label:
                     label = id2label[str_id]
                     self.frame_stats[label] = int(count)
+        
+        # Increment counter and save periodically
+        self.processed_frames += 1
+        if self.processed_frames % SAVE_INTERVAL_FRAMES == 0:
+            append_frame_stats(dict(self.frame_stats))
 
 stream_state = StreamState()
 
@@ -436,19 +532,71 @@ async def get_labels():
 
 @app.get("/api/stats/{period}")
 async def get_stats(period: str):
-    """Get label statistics for a time period (day/week/month/3month/6month)"""
-    stats = load_label_stats()
-    period_map = {
-        "day": "daily",
-        "week": "weekly", 
-        "month": "monthly",
-        "3month": "3month",
-        "6month": "6month"
+    """Get mean pixel area statistics for a time period (day/week/month/3month/6month)"""
+    return compute_period_mean(period)
+
+@app.get("/api/timeseries")
+async def get_timeseries(limit: int = Query(default=50), labels_limit: int = Query(default=5)):
+    """
+    Get recent time-series data for line chart visualization.
+    
+    Args:
+        limit: Maximum number of data points to return (default 50)
+        labels_limit: Maximum number of labels to include (default 5, top by total count)
+    
+    Returns:
+        Dict with timestamps, datasets (one per label), and label colors
+    """
+    data = load_time_series()
+    time_series = data.get("time_series", [])
+    
+    if not time_series:
+        return {"timestamps": [], "datasets": [], "labels": []}
+    
+    # Get the last N entries
+    recent = time_series[-limit:] if len(time_series) > limit else time_series
+    
+    # Collect all labels and count total occurrences
+    label_totals: Dict[str, int] = defaultdict(int)
+    for entry in recent:
+        for label, count in entry.get("labels", {}).items():
+            label_totals[label] += count
+    
+    # Get top labels (coral labels prioritized)
+    sorted_labels = sorted(label_totals.items(), key=lambda x: x[1], reverse=True)
+    top_labels = [label for label, _ in sorted_labels[:labels_limit]]
+    
+    # Build timestamps and datasets
+    timestamps = []
+    datasets = {label: [] for label in top_labels}
+    
+    for entry in recent:
+        try:
+            ts = datetime.fromisoformat(entry["timestamp"])
+            timestamps.append(ts.strftime("%H:%M:%S"))
+        except (ValueError, KeyError):
+            timestamps.append("")
+        
+        entry_labels = entry.get("labels", {})
+        for label in top_labels:
+            datasets[label].append(entry_labels.get(label, 0))
+    
+    # Format as list of dataset objects for Chart.js
+    formatted_datasets = []
+    for label in top_labels:
+        color = color_map.get(label, "#FFFFFF")
+        formatted_datasets.append({
+            "label": label,
+            "label_vn": label2vietnamese.get(label, label),
+            "data": datasets[label],
+            "color": color
+        })
+    
+    return {
+        "timestamps": timestamps,
+        "datasets": formatted_datasets,
+        "labels": top_labels
     }
-    key = period_map.get(period, "daily")
-    if key in stats:
-        return stats[key]
-    return {"labels": [], "values": [], "message": f"No data for period: {period}"}
 
 @app.get("/api/current_stats")
 async def get_current_stats():

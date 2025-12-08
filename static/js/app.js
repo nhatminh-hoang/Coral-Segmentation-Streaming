@@ -15,6 +15,8 @@ const AppState = {
     skipFrames: 3,
     isConnected: false,
     chart: null,
+    timeseriesChart: null,  // Line chart for trends
+    timeseriesData: { timestamps: [], datasets: [] },  // Real-time data buffer
     reconnectAttempts: 0,
     maxReconnectAttempts: 5,
     // Hover label data
@@ -38,10 +40,12 @@ const Elements = {
     mainContent: document.querySelector('.main-content'),
     streamFullscreenBtn: document.getElementById('stream-fullscreen-btn'),
     statsFullscreenBtn: document.getElementById('stats-fullscreen-btn'),
+    timeseriesFullscreenBtn: document.getElementById('timeseries-fullscreen-btn'),
     connectionStatus: document.getElementById('connection-status'),
     fpsValue: document.getElementById('fps-value'),
     labelsGrid: document.getElementById('labels-grid'),
     statsChart: document.getElementById('stats-chart'),
+    timeseriesChart: document.getElementById('timeseries-chart'),
     settingsBtn: document.getElementById('settings-btn'),
     settingsPanel: document.getElementById('settings-panel'),
     settingsOverlay: document.getElementById('settings-overlay'),
@@ -65,11 +69,13 @@ async function init() {
     // Load labels
     await loadLabels();
 
-    // Initialize chart
+    // Initialize charts
     initChart();
+    initTimeseriesChart();
 
-    // Load initial statistics
+    // Load initial statistics and timeseries
     loadStats(AppState.currentPeriod);
+    loadTimeseries();
 
     // Setup event listeners
     setupEventListeners();
@@ -139,6 +145,10 @@ async function toggleLabel(labelName) {
         }
 
         updateLabelButtonState(labelName);
+
+        // Refresh charts to apply filter
+        loadStats(AppState.currentPeriod);
+        loadTimeseries();
     } catch (error) {
         console.error('Failed to toggle label:', error);
     }
@@ -398,23 +408,262 @@ function initChart() {
 function updateChart(data) {
     if (!AppState.chart || !data.labels || !data.values) return;
 
-    // Get colors for each label
-    const colors = data.labels.map(labelName => {
+    // Filter to only show active labels
+    const filteredIndices = [];
+    const filteredLabels = [];
+    const filteredValues = [];
+
+    data.labels.forEach((labelName, index) => {
+        if (AppState.activeLabels.has(labelName)) {
+            filteredIndices.push(index);
+            filteredLabels.push(labelName);
+            filteredValues.push(data.values[index]);
+        }
+    });
+
+    // Get colors for each filtered label
+    const colors = filteredLabels.map(labelName => {
         const label = AppState.labels.find(l => l.name === labelName);
         return label ? label.color : '#6b7280';
     });
 
     // Translate labels if needed
-    const displayLabels = data.labels.map(labelName => {
+    const displayLabels = filteredLabels.map(labelName => {
         if (AppState.language === 'English') return labelName;
         const label = AppState.labels.find(l => l.name === labelName);
         return label ? label.name_vn : labelName;
     });
 
     AppState.chart.data.labels = displayLabels;
-    AppState.chart.data.datasets[0].data = data.values;
+    AppState.chart.data.datasets[0].data = filteredValues;
     AppState.chart.data.datasets[0].backgroundColor = colors;
     AppState.chart.update('none');
+}
+
+// ==============================
+// Time-Series Line Chart
+// ==============================
+// Track highlighted dataset for legend interaction
+let highlightedDatasetIndex = null;  // null = no highlight, number = locked highlight
+
+function setDatasetHighlight(chart, highlightIndex) {
+    // Set opacity for all datasets based on highlight state
+    chart.data.datasets.forEach((dataset, index) => {
+        if (highlightIndex === null) {
+            // No highlight - restore all to full opacity
+            dataset.borderColor = dataset._originalColor || dataset.borderColor;
+            dataset.backgroundColor = (dataset._originalColor || dataset.borderColor) + '20';
+            dataset.borderWidth = 2;
+        } else if (index === highlightIndex) {
+            // This is the highlighted dataset - full opacity and thicker
+            dataset.borderColor = dataset._originalColor || dataset.borderColor;
+            dataset.backgroundColor = (dataset._originalColor || dataset.borderColor) + '40';
+            dataset.borderWidth = 3;
+        } else {
+            // Other datasets - fade out
+            dataset.borderColor = (dataset._originalColor || dataset.borderColor) + '30';
+            dataset.backgroundColor = (dataset._originalColor || dataset.borderColor) + '10';
+            dataset.borderWidth = 1;
+        }
+    });
+    chart.update('none');
+}
+
+function initTimeseriesChart() {
+    if (!Elements.timeseriesChart) {
+        console.warn('Timeseries chart canvas not found');
+        return;
+    }
+
+    const ctx = Elements.timeseriesChart.getContext('2d');
+
+    AppState.timeseriesChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: []
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: {
+                duration: 200  // Fast updates for real-time
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: {
+                        color: '#a0aec0',
+                        usePointStyle: true,
+                        pointStyle: 'circle',
+                        padding: 12,
+                        font: {
+                            size: 10
+                        }
+                    },
+                    onHover: function (event, legendItem, legend) {
+                        // Only apply hover highlight if no locked highlight
+                        if (highlightedDatasetIndex === null) {
+                            const chart = legend.chart;
+                            setDatasetHighlight(chart, legendItem.datasetIndex);
+                        }
+                        // Change cursor to pointer
+                        event.native.target.style.cursor = 'pointer';
+                    },
+                    onLeave: function (event, legendItem, legend) {
+                        // Only restore if no locked highlight
+                        if (highlightedDatasetIndex === null) {
+                            const chart = legend.chart;
+                            setDatasetHighlight(chart, null);
+                        }
+                    },
+                    onClick: function (event, legendItem, legend) {
+                        const chart = legend.chart;
+                        const clickedIndex = legendItem.datasetIndex;
+
+                        if (highlightedDatasetIndex === clickedIndex) {
+                            // Clicking same label again - unlock highlight
+                            highlightedDatasetIndex = null;
+                            setDatasetHighlight(chart, null);
+                        } else {
+                            // Lock highlight to this dataset
+                            highlightedDatasetIndex = clickedIndex;
+                            setDatasetHighlight(chart, clickedIndex);
+                        }
+                    }
+                },
+                tooltip: {
+                    mode: 'index',
+                    intersect: false,
+                    backgroundColor: 'rgba(26, 35, 50, 0.95)',
+                    titleColor: '#fff',
+                    bodyColor: '#a0aec0',
+                    borderColor: 'rgba(255, 255, 255, 0.1)',
+                    borderWidth: 1,
+                    cornerRadius: 8,
+                    padding: 12,
+                    callbacks: {
+                        label: function (context) {
+                            return `${context.dataset.label}: ${formatCount(context.raw)}`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    display: true,
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.05)'
+                    },
+                    ticks: {
+                        color: '#6b7280',
+                        font: { size: 9 },
+                        maxTicksLimit: 8,
+                        maxRotation: 0
+                    }
+                },
+                y: {
+                    display: true,
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.05)'
+                    },
+                    ticks: {
+                        color: '#6b7280',
+                        font: { size: 9 },
+                        callback: function (value) {
+                            return formatCount(value);
+                        }
+                    },
+                    beginAtZero: true
+                }
+            },
+            interaction: {
+                mode: 'nearest',
+                axis: 'x',
+                intersect: false
+            }
+        }
+    });
+
+    console.log('✅ Time-series chart initialized');
+}
+
+async function loadTimeseries() {
+    try {
+        const response = await fetch('/api/timeseries?limit=50&labels_limit=20');
+        const data = await response.json();
+        updateTimeseriesChart(data);
+    } catch (error) {
+        console.error('Failed to load timeseries:', error);
+    }
+}
+
+function updateTimeseriesChart(data) {
+    if (!AppState.timeseriesChart || !data.timestamps) return;
+
+    // Reset highlight when datasets change
+    highlightedDatasetIndex = null;
+
+    // Filter datasets to only show active labels
+    const filteredDatasets = data.datasets.filter(ds =>
+        AppState.activeLabels.has(ds.label)
+    );
+
+    // Build Chart.js datasets from filtered API data
+    const datasets = filteredDatasets.map(ds => {
+        const displayLabel = AppState.language === 'English' ? ds.label : ds.label_vn;
+        return {
+            label: displayLabel,
+            data: ds.data,
+            borderColor: ds.color,
+            backgroundColor: ds.color + '20',  // 20% opacity for fill
+            _originalColor: ds.color,  // Store original color for highlight restore
+            tension: 0.3,
+            fill: false,
+            pointRadius: 2,
+            pointHoverRadius: 4,
+            borderWidth: 2
+        };
+    });
+
+    AppState.timeseriesChart.data.labels = data.timestamps;
+    AppState.timeseriesChart.data.datasets = datasets;
+    AppState.timeseriesChart.update('none');
+}
+
+function addTimeseriesDataPoint(frameStats) {
+    // Add real-time data point from current frame
+    if (!AppState.timeseriesChart || !frameStats || Object.keys(frameStats).length === 0) return;
+
+    const now = new Date();
+    const timestamp = now.toTimeString().slice(0, 8);  // HH:MM:SS
+
+    // Get current labels from chart
+    const currentDatasets = AppState.timeseriesChart.data.datasets;
+    if (currentDatasets.length === 0) return;
+
+    // Add timestamp
+    AppState.timeseriesChart.data.labels.push(timestamp);
+
+    // Add data point for each dataset
+    currentDatasets.forEach(ds => {
+        // Find matching stat by label
+        const matchingLabel = AppState.labels.find(l =>
+            l.name === ds.label || l.name_vn === ds.label
+        );
+        const count = matchingLabel ? (frameStats[matchingLabel.name] || 0) : 0;
+        ds.data.push(count);
+    });
+
+    // Keep only last 50 points
+    const maxPoints = 50;
+    if (AppState.timeseriesChart.data.labels.length > maxPoints) {
+        AppState.timeseriesChart.data.labels.shift();
+        currentDatasets.forEach(ds => ds.data.shift());
+    }
+
+    AppState.timeseriesChart.update('none');
 }
 
 // ==============================
@@ -501,6 +750,10 @@ async function selectAllLabels(active) {
             body: JSON.stringify(labels)
         });
         renderLabelButtons();
+
+        // Refresh charts to apply filter
+        loadStats(AppState.currentPeriod);
+        loadTimeseries();
     } catch (error) {
         console.error('Failed to set labels:', error);
     }
@@ -533,6 +786,10 @@ function selectCoralLabels() {
         body: JSON.stringify(labels)
     }).then(() => {
         renderLabelButtons();
+
+        // Refresh charts to apply filter
+        loadStats(AppState.currentPeriod);
+        loadTimeseries();
     });
 }
 
@@ -632,11 +889,10 @@ function setupFullscreenToggle() {
             AppState.fullscreenMode = 'stream';
         }
 
-        // Resize chart after transition
+        // Resize charts after transition
         setTimeout(() => {
-            if (AppState.chart) {
-                AppState.chart.resize();
-            }
+            if (AppState.chart) AppState.chart.resize();
+            if (AppState.timeseriesChart) AppState.timeseriesChart.resize();
         }, 300);
     });
 
@@ -656,13 +912,40 @@ function setupFullscreenToggle() {
             AppState.fullscreenMode = 'stats';
         }
 
-        // Resize chart after transition
+        // Resize charts after transition
         setTimeout(() => {
-            if (AppState.chart) {
-                AppState.chart.resize();
-            }
+            if (AppState.chart) AppState.chart.resize();
+            if (AppState.timeseriesChart) AppState.timeseriesChart.resize();
         }, 300);
     });
+
+    // Toggle timeseries fullscreen (also makes stats bigger, same as stats fullscreen)
+    const timeseriesBtn = Elements.timeseriesFullscreenBtn;
+    if (timeseriesBtn) {
+        timeseriesBtn.addEventListener('click', () => {
+            if (AppState.fullscreenMode === 'stats') {
+                // Exit fullscreen
+                mainContent.classList.remove('stats-fullscreen');
+                timeseriesBtn.classList.remove('active');
+                statsBtn.classList.remove('active');
+                AppState.fullscreenMode = null;
+            } else {
+                // Enter stats fullscreen (expands both charts)
+                mainContent.classList.remove('stream-fullscreen');
+                mainContent.classList.add('stats-fullscreen');
+                timeseriesBtn.classList.add('active');
+                statsBtn.classList.add('active');
+                streamBtn.classList.remove('active');
+                AppState.fullscreenMode = 'stats';
+            }
+
+            // Resize charts after transition
+            setTimeout(() => {
+                if (AppState.chart) AppState.chart.resize();
+                if (AppState.timeseriesChart) AppState.timeseriesChart.resize();
+            }, 300);
+        });
+    }
 
     console.log('✅ Fullscreen toggle initialized');
 }

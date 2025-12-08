@@ -484,15 +484,50 @@ body {
 /* Chart Container */
 .chart-container {
     flex: 1;
-    min-height: 150px;
-    max-height: 400px;
+    min-height: 120px;
+    max-height: 300px;
     transition: max-height var(--transition-normal);
+}
+
+/* Time-Series Chart Section */
+.timeseries-section {
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-lg);
+    padding: var(--spacing-md);
+    border: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+}
+
+.timeseries-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-md);
+}
+
+.timeseries-header h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.timeseries-chart-container {
+    flex: 1;
+    min-height: 120px;
+    max-height: 250px;
+    position: relative;
 }
 
 /* Make chart larger in stats fullscreen mode */
 .main-content.stats-fullscreen .chart-container {
     max-height: none;
-    height: calc(100vh - 200px);
+    height: calc(50vh - 150px);
+}
+
+.main-content.stats-fullscreen .timeseries-chart-container {
+    max-height: none;
+    height: calc(50vh - 150px);
 }
 
 /* Label Actions */
