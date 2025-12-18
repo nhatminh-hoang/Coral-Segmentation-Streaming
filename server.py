@@ -9,11 +9,15 @@ New FastAPI server for production deployment with:
 """
 
 import os
+import re
 import json
+import base64
 import asyncio
+from threading import Lock
 from io import BytesIO
 from pathlib import Path
 import time as time_module
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Set
 from collections import defaultdict
 
@@ -252,71 +256,182 @@ class StreamState:
 stream_state = StreamState()
 
 # ==============================
-# FRAME CACHE (5-Frame Ring Buffer)
+# CHUNK MANAGEMENT
 # ==============================
-import base64
-from dataclasses import dataclass, field
-from threading import Lock
+CHUNK_DIR = Path("chunks")
+MAX_CHUNKS = 5
 
 @dataclass
-class CachedFrame:
-    """Single cached frame with all data needed for clients"""
-    image_b64: str  # Base64 encoded JPEG
-    pred_map_b64: str  # Base64 encoded downsampled prediction map
-    pred_shape: List[int]  # [height, width] of downsampled pred map
-    pred_scale: int  # Downsample scale factor
-    fps: float
-    avg_fps: float
-    total_frames: int
-    visible_labels: List[Dict]
-    timestamp: float = field(default_factory=time_module.time)
+class ChunkInfo:
+    timestamp: str  # Format: DD_MM_YYYY_HH_MM_SS
+    video_path: Path
+    pred_path: Path
+    created_at: float = field(default_factory=time_module.time)
 
-class FrameCache:
-    """Thread-safe cache storing the 5 most recent processed frames"""
-    
-    def __init__(self, max_size: int = 5):
-        self.max_size = max_size
-        self._frames: List[CachedFrame] = []
+class ChunkManager:
+    """Thread-safe manager for 1-minute video chunks and prediction data"""
+    def __init__(self, storage_dir: Path = CHUNK_DIR):
+        self.storage_dir = storage_dir
+        self.storage_dir.mkdir(exist_ok=True)
+        self._chunks: List[ChunkInfo] = []
         self._lock = Lock()
-        self._frame_event = asyncio.Event()  # Signal new frame availability
-    
-    def push(self, frame: CachedFrame):
-        """Add a new frame to the cache (thread-safe)"""
-        with self._lock:
-            self._frames.append(frame)
-            if len(self._frames) > self.max_size:
-                self._frames.pop(0)  # Remove oldest
-    
-    def get_latest(self) -> Optional[CachedFrame]:
-        """Get the most recent cached frame (thread-safe)"""
-        with self._lock:
-            return self._frames[-1] if self._frames else None
-    
-    def get_all(self) -> List[CachedFrame]:
-        """Get all cached frames (thread-safe)"""
-        with self._lock:
-            return list(self._frames)
-    
-    def notify_new_frame(self):
-        """Signal that a new frame is available"""
-        self._frame_event.set()
-    
-    async def wait_for_frame(self, timeout: float = 1.0):
-        """Wait for a new frame signal with timeout"""
-        try:
-            await asyncio.wait_for(self._frame_event.wait(), timeout=timeout)
-            self._frame_event.clear()
-            return True
-        except asyncio.TimeoutError:
-            return False
-    
-    def clear(self):
-        """Clear all cached frames"""
-        with self._lock:
-            self._frames.clear()
+        self._loop_mode = False
+        self._load_existing_chunks()
 
-# Global frame cache
-frame_cache = FrameCache(max_size=5)
+    def _load_existing_chunks(self):
+        """Scan directory for existing chunks and populate queue"""
+        import re
+        pattern = re.compile(r"chunk_(\d{2}_\d{2}_\d{4}_\d{2}_\d{2}_\d{2})\.mp4")
+        found = []
+        for p in self.storage_dir.glob("chunk_*.mp4"):
+            match = pattern.search(p.name)
+            if match:
+                ts = match.group(1)
+                pred_p = p.with_name(f"chunk_{ts}_preds.npy")
+                if pred_p.exists():
+                    found.append(ChunkInfo(ts, p, pred_p, p.stat().st_mtime))
+        
+        def parse_ts(ts):
+            try: return datetime.strptime(ts, "%d_%m_%Y_%H_%M_%S")
+            except: return datetime.min
+        
+        found.sort(key=lambda x: parse_ts(x.timestamp))
+        self._chunks = found[-MAX_CHUNKS:]
+        
+        for p in self.storage_dir.glob("chunk_*"):
+            ts_match = pattern.search(p.name) or re.search(r"chunk_(\d{2}_\d{2}_\d{4}_\d{2}_\d{2}_\d{2})_preds\.npy", p.name)
+            if ts_match:
+                ts = ts_match.group(1)
+                if not any(c.timestamp == ts for c in self._chunks):
+                    try: p.unlink()
+                    except: pass
+
+    def add_chunk(self, timestamp: str, video_path: Path, pred_path: Path):
+        """Add a new chunk and maintain rotation (max 5)"""
+        with self._lock:
+            new_chunk = ChunkInfo(timestamp, video_path, pred_path)
+            self._chunks.append(new_chunk)
+            if len(self._chunks) > MAX_CHUNKS:
+                old = self._chunks.pop(0)
+                try:
+                    old.video_path.unlink()
+                    old.pred_path.unlink()
+                except: pass
+            self._loop_mode = False
+
+    def get_latest(self) -> Optional[ChunkInfo]:
+        with self._lock: return self._chunks[-1] if self._chunks else None
+
+    def get_all(self) -> List[ChunkInfo]:
+        with self._lock: return list(self._chunks)
+
+    def is_loop_mode(self) -> bool:
+        with self._lock: return self._loop_mode
+
+    def set_loop_mode(self, enabled: bool):
+        with self._lock: self._loop_mode = enabled
+
+    def rescan_from_disk(self):
+        """Rescan chunks directory to sync with actual files on disk"""
+        with self._lock:
+            pattern = re.compile(r"chunk_(\d{2}_\d{2}_\d{4}_\d{2}_\d{2}_\d{2})\.mp4")
+            found = {}
+            for p in self.storage_dir.glob("chunk_*.mp4"):
+                m = pattern.search(p.name)
+                if m:
+                    ts = m.group(1)
+                    pred_p = p.with_name(p.stem + "_preds.npy")
+                    if pred_p.exists():
+                        found[ts] = ChunkInfo(ts, p, pred_p)
+            
+            # Update chunks list to only include actually existing files
+            self._chunks = [found[c.timestamp] for c in self._chunks if c.timestamp in found]
+            # Add any new chunks not in our list
+            for ts, chunk in sorted(found.items()):
+                if not any(c.timestamp == ts for c in self._chunks):
+                    self._chunks.append(chunk)
+            # Sort by timestamp
+            self._chunks.sort(key=lambda c: c.timestamp)
+            # Keep only MAX_CHUNKS
+            while len(self._chunks) > MAX_CHUNKS:
+                self._chunks.pop(0)
+
+chunk_manager = ChunkManager()
+
+# ==============================
+# BROADCAST STATE
+# ==============================
+class GlobalBroadcastState:
+    """Manages the current global playback time and active chunk"""
+    def __init__(self):
+        self.current_chunk_ts: Optional[str] = None
+        self.chunk_start_time: float = 0
+        self.fps: float = 15.0  # Assumed FPS for broadcast
+        self._lock = None # asyncio.Lock - init in ensure_init
+        self.frame_count = 0
+        self._cv = None # asyncio.Condition - init in ensure_init
+
+    def _ensure_init(self):
+        """Lazy initialization of async primitives to ensure they use the correct event loop"""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        if self._cv is None:
+            self._cv = asyncio.Condition(self._lock)
+
+    async def get_current_frame_idx(self) -> int:
+        """Calculate current frame index based on global clock sync"""
+        self._ensure_init()
+        async with self._lock:
+            if self.chunk_start_time == 0: return 0
+            now = time_module.time()
+            return int((now - self.chunk_start_time) * self.fps)
+
+    async def notify_frame(self):
+        self._ensure_init()
+        async with self._cv:
+            self.frame_count += 1
+            self._cv.notify_all()
+
+    async def wait_for_frame(self, last_count: int, timeout: float = 0.5) -> int:
+        self._ensure_init()
+        try:
+            async with self._cv:
+                await asyncio.wait_for(
+                    self._cv.wait_for(lambda: self.frame_count > last_count),
+                    timeout=timeout
+                )
+                return self.frame_count
+        except asyncio.TimeoutError:
+            return last_count
+
+    async def update(self):
+        """Update global state - called periodically"""
+        self._ensure_init()
+        async with self._lock:
+            now = time_module.time()
+            if self.current_chunk_ts is None or (now - self.chunk_start_time) >= 60:
+                latest = chunk_manager.get_latest()
+                if latest and (self.current_chunk_ts is None or latest.timestamp > self.current_chunk_ts):
+                    self.current_chunk_ts = latest.timestamp
+                    self.chunk_start_time = now
+                    print(f"🔄 Broadcast transitioned to new chunk: {self.current_chunk_ts}")
+                else:
+                    # No new chunk found - enter/remain in loop mode
+                    chunk_manager.set_loop_mode(True)
+                    all_chunks = chunk_manager.get_all()
+                    if all_chunks:
+                        loop_pool = all_chunks[-3:]
+                        try:
+                            curr_idx = next(i for i, c in enumerate(loop_pool) if c.timestamp == self.current_chunk_ts)
+                            next_idx = (curr_idx + 1) % len(loop_pool)
+                        except StopIteration:
+                            next_idx = 0
+                        next_chunk = loop_pool[next_idx]
+                        self.current_chunk_ts = next_chunk.timestamp
+                        self.chunk_start_time = now
+                        print(f"🔁 Looping to chunk: {self.current_chunk_ts}")
+
+broadcast_state = GlobalBroadcastState()
 
 # ==============================
 # OVERLAY CREATION HELPER
@@ -345,163 +460,168 @@ def create_filtered_overlay(pred_map: np.ndarray, base_rgb: np.ndarray, alpha: f
     return blended
 
 # ==============================
-# BACKGROUND FRAME PROCESSOR
+# PARALLEL PROCESSOR (Broadcaster Only)
 # ==============================
-class FrameProcessor:
-    """Background processor that processes exactly 1 frame at a time"""
-    
+class ParallelProcessor:
+    """Manages broadcasting from pre-generated chunks (segmentation is a separate process)"""
     def __init__(self):
         self._running = False
-        self._task: Optional[asyncio.Task] = None
-    
+        self._tasks: List[asyncio.Task] = []
+        self._broadcast_buffer: List[str] = []  # In-memory frames (base64 JPEG) for current chunk
+        self._broadcast_preds: Optional[np.ndarray] = None
+        self._buffer_lock = Lock()
+        self._last_seen_chunk: Optional[str] = None
+
     async def start(self):
-        """Start the background processing task"""
-        if self._running:
-            return
+        if self._running: return
         self._running = True
-        self._task = asyncio.create_task(self._process_loop())
-        print("🎬 Background frame processor started")
-    
+        self._tasks = [
+            asyncio.create_task(self._broadcaster_loop()),
+            asyncio.create_task(self._chunk_watcher_loop())
+        ]
+        print("🎬 Broadcaster started (watching chunks directory)")
+
     async def stop(self):
-        """Stop the background processing task"""
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        print("🛑 Background frame processor stopped")
-    
-    async def _process_loop(self):
-        """Main processing loop - runs continuously"""
+        for t in self._tasks:
+            t.cancel()
+        print("🛑 Broadcaster stopped")
+
+    async def _chunk_watcher_loop(self):
+        """Watch for new chunks in the directory"""
         while self._running:
             try:
-                await self._process_source()
+                # Rescan directory to sync with actual files
+                chunk_manager.rescan_from_disk()
+                
+                # Check for new chunks
+                all_chunks = chunk_manager.get_all()
+                if all_chunks:
+                    latest = all_chunks[-1]
+                    if latest.timestamp != self._last_seen_chunk:
+                        print(f"🔄 New chunk detected: {latest.timestamp}")
+                        self._last_seen_chunk = latest.timestamp
+                        broadcast_state.current_chunk_ts = latest.timestamp
+                        broadcast_state.chunk_start_time = time_module.time()
+                        await self._load_chunk_to_buffer(latest.timestamp)
+                await asyncio.sleep(2.0)  # Check every 2 seconds
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Frame processor error: {e}")
-                await asyncio.sleep(2.0)
-    
-    async def _process_source(self):
-        """Process video from current source (camera or sample videos)"""
-        model.reset_fps_stats()
-        stream_state.source_changed = False
-        
-        if stream_state.camera_url:
-            # Use camera/stream URL
-            cap = cv2.VideoCapture(stream_state.camera_url)
-            if not cap.isOpened():
-                print(f"Cannot open camera: {stream_state.camera_url}")
-                await asyncio.sleep(2.0)
-                return
-            
-            try:
-                await self._process_video(cap, "Camera Stream")
-            finally:
-                cap.release()
-        else:
-            # Use sample videos
-            files = list_video_files(VIDEO_DIR)
-            
-            if not files:
-                print("No videos found in ./sample_videos")
-                await asyncio.sleep(2.0)
-                return
-            
-            for path in files:
-                if stream_state.source_changed or not self._running:
-                    break
-                    
-                cap = cv2.VideoCapture(str(path))
-                if not cap.isOpened():
-                    print(f"Cannot open: {path.name}")
-                    continue
-                
-                try:
-                    await self._process_video(cap, path.name)
-                finally:
-                    cap.release()
-        
-        await asyncio.sleep(1.0)
-    
-    async def _process_video(self, cap, source_name: str):
-        """Process a single video source"""
-        idx = 0
-        
-        while self._running and not stream_state.source_changed:
-            frame = _safe_read(cap)
-            if frame is None:
-                break
-            
-            skip = stream_state.skip_frames
-            if skip > 1 and (idx % skip) != 0:
-                idx += 1
-                # Small yield to prevent blocking
-                if idx % 10 == 0:
-                    await asyncio.sleep(0)
-                continue
-            
-            # Process frame (this is the GPU-intensive part - only happens ONCE per frame)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pred_map, overlay_pil, base_rgb = model.predict_map_and_overlay(frame_rgb)
-            
-            # Update global frame statistics
-            stream_state.update_frame_stats(pred_map)
-            
-            # Create filtered overlay based on active labels
-            overlay_rgb = create_filtered_overlay(pred_map, base_rgb)
-            
-            # Encode as JPEG
-            _, buffer = cv2.imencode('.jpg', cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR), 
-                                     [cv2.IMWRITE_JPEG_QUALITY, 85])
-            image_b64 = base64.b64encode(buffer).decode('utf-8')
-            
-            # Get FPS info
-            fps_stats = model.get_fps_stats()
-            
-            # Get visible labels stats
-            visible_stats = []
-            for label, count in stream_state.frame_stats.items():
-                if label in stream_state.active_labels:
-                    visible_stats.append({
-                        "label": label,
-                        "count": count,
-                        "color": color_map.get(label, "#FFF")
-                    })
-            visible_stats.sort(key=lambda x: x["count"], reverse=True)
-            
-            # Downsample prediction map for hover feature
-            h, w = pred_map.shape
-            scale = 4
-            pred_small = pred_map[::scale, ::scale]
-            pred_bytes = pred_small.astype(np.uint8).tobytes()
-            pred_b64 = base64.b64encode(pred_bytes).decode('utf-8')
-            
-            # Create cached frame
-            cached = CachedFrame(
-                image_b64=image_b64,
-                pred_map_b64=pred_b64,
-                pred_shape=[pred_small.shape[0], pred_small.shape[1]],
-                pred_scale=scale,
-                fps=fps_stats["current_fps"],
-                avg_fps=fps_stats["average_fps"],
-                total_frames=fps_stats["total_frames"],
-                visible_labels=visible_stats[:8]
-            )
-            
-            # Push to cache and notify waiting clients
-            frame_cache.push(cached)
-            frame_cache.notify_new_frame()
-            
-            idx += 1
-            
-            # Yield to event loop to allow WebSocket handlers to run
-            await asyncio.sleep(0)
+                print(f"Chunk watcher error: {e}")
+                await asyncio.sleep(5.0)
 
-# Global frame processor
-frame_processor = FrameProcessor()
+    async def _broadcaster_loop(self):
+        """Task B: Syncs global playback and loads current chunk into memory at 15fps ticker"""
+        prev_chunk_ts = None
+        while self._running:
+            try:
+                # 1. Update global state (decide which chunk to play)
+                await broadcast_state.update()
+                
+                # 2. If chunk changed, load it into memory
+                curr_ts = broadcast_state.current_chunk_ts
+                if curr_ts and curr_ts != prev_chunk_ts:
+                    await self._load_chunk_to_buffer(curr_ts)
+                    prev_chunk_ts = curr_ts
+                
+                # 3. Tight loop for roughly 1 second of 15fps ticking
+                for _ in range(15):
+                    if not self._running: break
+                    await broadcast_state.notify_frame()
+                    await asyncio.sleep(1/15.0)
+            except Exception as e:
+                print(f"Broadcaster error: {e}")
+                await asyncio.sleep(1.0)
+
+    async def _load_chunk_to_buffer(self, timestamp: str):
+        """Load video frames and prediction maps into RAM for high-efficiency broadcast"""
+        all_chunks = chunk_manager.get_all()
+        chunk = next((c for c in all_chunks if c.timestamp == timestamp), None)
+        if not chunk: return
+
+        print(f"📥 Loading chunk {timestamp} to RAM...")
+        
+        # Load predictions
+        try:
+            preds = np.load(chunk.pred_path)
+        except Exception as e:
+            print(f"Error loading predictions for {timestamp}: {e}")
+            return
+
+        # Load video frames
+        cap = cv2.VideoCapture(str(chunk.video_path))
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok: break
+            
+            # Encode as JPEG and base64
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            image_b64 = base64.b64encode(buffer).decode('utf-8')
+            frames.append(image_b64)
+            if len(frames) % 50 == 0: await asyncio.sleep(0) # Yield
+        
+        cap.release()
+        
+        with self._buffer_lock:
+            self._broadcast_buffer = frames
+            self._broadcast_preds = preds
+        
+        print(f"⚡ RAM buffer ready: {len(frames)} frames for chunk {timestamp}")
+
+    async def get_current_frame_data(self) -> Optional[Dict]:
+        """Get the current frame data from RAM buffer for shared broadcast"""
+        with self._buffer_lock:
+            if not self._broadcast_buffer: 
+                print("DEBUG: Broadcast buffer empty")
+                return None
+            
+            # Use global sync index
+            idx = await broadcast_state.get_current_frame_idx()
+            if idx >= len(self._broadcast_buffer):
+                idx = len(self._broadcast_buffer) - 1
+            if idx < 0: idx = 0
+            
+            image_b64 = self._broadcast_buffer[idx]
+            
+            # Handle missing predictions gracefully
+            pred_b64 = ""
+            pred_shape = [0, 0]
+            visible_stats = []
+            
+            if self._broadcast_preds is not None and idx < len(self._broadcast_preds):
+                pred_small = self._broadcast_preds[idx]
+                
+                # Update global stats for dashboards
+                stream_state.update_frame_stats(pred_small)
+                
+                # Get visible labels stats for WebSocket
+                for label, count in stream_state.frame_stats.items():
+                    if label in stream_state.active_labels:
+                        visible_stats.append({
+                            "label": label,
+                            "count": count,
+                            "color": color_map.get(label, "#FFF")
+                        })
+                visible_stats.sort(key=lambda x: x["count"], reverse=True)
+                
+                # Hover map encoding
+                pred_b64 = base64.b64encode(pred_small.tobytes()).decode('utf-8')
+                pred_shape = [pred_small.shape[0], pred_small.shape[1]]
+            
+            return {
+                "image": image_b64,
+                "pred_map": pred_b64,
+                "pred_shape": pred_shape,
+                "pred_scale": 4,
+                "fps": 15.0,
+                "avg_fps": 15.0,
+                "total_frames": idx,
+                "visible_labels": visible_stats[:8]
+            }
+
+parallel_processor = ParallelProcessor()
 
 # ==============================
 # API ROUTES
@@ -662,13 +782,13 @@ async def get_camera_url():
 # ==============================
 @app.on_event("startup")
 async def startup_event():
-    """Start the background frame processor on app startup"""
-    await frame_processor.start()
+    """Start the parallel processor on app startup"""
+    await parallel_processor.start()
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Stop the background frame processor on app shutdown"""
-    await frame_processor.stop()
+    """Stop the parallel processor on app shutdown"""
+    await parallel_processor.stop()
 
 # ==============================
 # WEBSOCKET STREAMING (Cache-based)
@@ -678,71 +798,52 @@ async def websocket_stream(websocket: WebSocket):
     """
     WebSocket endpoint for real-time video streaming.
     
-    Clients receive frames from the shared cache instead of triggering
-    individual GPU processing. This ensures O(1) GPU load regardless
-    of the number of connected clients.
+    Clients receive frames from the shared RAM buffer managed by 
+    the broadcaster. All clients are synchronized to the global clock.
     """
     await websocket.accept()
-    print(f"✅ WebSocket client connected (total: active)")
+    print(f"✅ synchronized WebSocket client connected")
     
-    # Track the last frame timestamp sent to this client
-    last_sent_timestamp = 0.0
+    # Track the last frame index sent to this client to avoid duplicates
+    last_sent_idx = -1
+    last_chunk_ts = None
+    last_count = 0
     
     try:
-        # Send latest cached frame immediately if available (instant join experience)
-        latest = frame_cache.get_latest()
-        if latest:
-            await websocket.send_json({
-                "type": "frame",
-                "image": latest.image_b64,
-                "fps": latest.fps,
-                "avg_fps": latest.avg_fps,
-                "total_frames": latest.total_frames,
-                "visible_labels": latest.visible_labels,
-                "pred_map": latest.pred_map_b64,
-                "pred_shape": latest.pred_shape,
-                "pred_scale": latest.pred_scale
-            })
-            last_sent_timestamp = latest.timestamp
-        
         while True:
-            # Handle incoming commands from client (non-blocking)
+            # Handle incoming commands (non-blocking)
             try:
-                data = await asyncio.wait_for(
-                    websocket.receive_json(),
-                    timeout=0.001
-                )
-                # Handle incoming commands
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=0.001)
                 if data.get("type") == "toggle_label":
                     label = data.get("label")
-                    if label:
-                        stream_state.toggle_label(label)
-                elif data.get("type") == "set_skip":
-                    stream_state.skip_frames = data.get("skip", DEFAULT_SKIP)
-                elif data.get("type") == "set_camera_url":
-                    stream_state.camera_url = data.get("url") or None
-                    stream_state.source_changed = True
+                    if label: stream_state.toggle_label(label)
             except asyncio.TimeoutError:
                 pass
             
-            # Wait for new frame or timeout
-            await frame_cache.wait_for_frame(timeout=0.1)
+            # Wait for global frame signal
+            last_count = await broadcast_state.wait_for_frame(last_count, timeout=0.1)
             
-            # Get latest frame from cache
-            latest = frame_cache.get_latest()
-            if latest and latest.timestamp > last_sent_timestamp:
-                await websocket.send_json({
-                    "type": "frame",
-                    "image": latest.image_b64,
-                    "fps": latest.fps,
-                    "avg_fps": latest.avg_fps,
-                    "total_frames": latest.total_frames,
-                    "visible_labels": latest.visible_labels,
-                    "pred_map": latest.pred_map_b64,
-                    "pred_shape": latest.pred_shape,
-                    "pred_scale": latest.pred_scale
-                })
-                last_sent_timestamp = latest.timestamp
+            # Get data from RAM buffer
+            curr_idx = await broadcast_state.get_current_frame_idx()
+            curr_ts = broadcast_state.current_chunk_ts
+            
+            if curr_ts != last_chunk_ts or curr_idx != last_sent_idx:
+                fdata = await parallel_processor.get_current_frame_data()
+                if fdata:
+                    if curr_idx % 15 == 0: print(f"DEBUG: Sending frame {curr_idx} for chunk {curr_ts}")
+                    await websocket.send_json({
+                        "type": "frame",
+                        "image": fdata["image"],
+                        "fps": fdata["fps"],
+                        "avg_fps": fdata["avg_fps"],
+                        "total_frames": fdata["total_frames"],
+                        "visible_labels": fdata["visible_labels"],
+                        "pred_map": fdata["pred_map"],
+                        "pred_shape": fdata["pred_shape"],
+                        "pred_scale": fdata["pred_scale"]
+                    })
+                    last_sent_idx = curr_idx
+                    last_chunk_ts = curr_ts
             
     except WebSocketDisconnect:
         print("❌ WebSocket client disconnected")

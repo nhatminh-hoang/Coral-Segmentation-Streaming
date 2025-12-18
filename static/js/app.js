@@ -15,17 +15,23 @@ const AppState = {
     skipFrames: 3,
     isConnected: false,
     chart: null,
-    timeseriesChart: null,  // Line chart for trends
-    timeseriesData: { timestamps: [], datasets: [] },  // Real-time data buffer
+    timeseriesChart: null,
+    timeseriesData: { timestamps: [], datasets: [] },
     reconnectAttempts: 0,
     maxReconnectAttempts: 5,
     // Hover label data
     predMap: null,
     predShape: [0, 0],
     predScale: 4,
-    id2label: {},  // Will be populated from labels
+    id2label: {},
     // Fullscreen state
-    fullscreenMode: null  // null, 'stream', or 'stats'
+    fullscreenMode: null,
+    // Real FPS measurement
+    realFps: {
+        frameCount: 0,
+        lastTime: performance.now(),
+        value: 0
+    }
 };
 
 // ==============================
@@ -208,12 +214,11 @@ function handleWebSocketMessage(data) {
             Elements.streamImage.src = `data:image/jpeg;base64,${data.image}`;
             Elements.streamOverlay.classList.add('hidden');
 
-            // Update FPS
-            Elements.fpsValue.textContent = data.fps.toFixed(1);
+            // Update real FPS (client-side measurement)
+            updateRealFps();
 
             // Store prediction map for hover labels
             if (data.pred_map) {
-                // Decode base64 prediction map
                 const binaryString = atob(data.pred_map);
                 const bytes = new Uint8Array(binaryString.length);
                 for (let i = 0; i < binaryString.length; i++) {
@@ -222,6 +227,20 @@ function handleWebSocketMessage(data) {
                 AppState.predMap = bytes;
                 AppState.predShape = data.pred_shape;
                 AppState.predScale = data.pred_scale;
+            }
+
+            // Update live labels list
+            if (data.visible_labels) {
+                updateLiveLabels(data.visible_labels);
+            }
+
+            // Update real-time timeseries chart
+            const frameStats = {};
+            if (data.visible_labels) {
+                data.visible_labels.forEach(item => {
+                    frameStats[item.label] = item.count;
+                });
+                addTimeseriesDataPoint(frameStats);
             }
             break;
 
@@ -301,9 +320,36 @@ function updateLabelButtonState(labelName) {
     }
 }
 
-function updateLiveLabels(visibleLabels) {
-    Elements.liveLabels.innerHTML = '';
+// ==============================
+// Real FPS Measurement (Client-Side)
+// ==============================
+function updateRealFps() {
+    // Ensure realFps is initialized
+    if (!AppState.realFps) {
+        AppState.realFps = {
+            frameCount: 0,
+            lastTime: performance.now(),
+            value: 0
+        };
+    }
 
+    const now = performance.now();
+    AppState.realFps.frameCount++;
+
+    // Update FPS display every second
+    if (now - AppState.realFps.lastTime >= 1000) {
+        AppState.realFps.value = AppState.realFps.frameCount;
+        Elements.fpsValue.textContent = AppState.realFps.value.toFixed(1);
+        AppState.realFps.frameCount = 0;
+        AppState.realFps.lastTime = now;
+    }
+}
+
+function updateLiveLabels(visibleLabels) {
+    const container = document.getElementById('live-labels');
+    if (!container) return;
+
+    container.innerHTML = '';
     visibleLabels.forEach(item => {
         const div = document.createElement('div');
         div.className = 'live-label-item';
@@ -311,7 +357,7 @@ function updateLiveLabels(visibleLabels) {
             <span class="live-label-color" style="background-color: ${item.color}"></span>
             <span class="live-label-name">${AppState.language === 'English' ? item.label : getLabelVietnamese(item.label)}</span>
         `;
-        Elements.liveLabels.appendChild(div);
+        container.appendChild(div);
     });
 }
 
