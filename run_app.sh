@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 source ~/miniconda3/bin/activate
-conda activate ml
+conda activate coral_streaming
 
 echo "=============================================="
 echo "🪸 CoralScapes Production Monitor"
@@ -15,8 +15,8 @@ python segmenter_worker.py &
 SEGMENTER_PID=$!
 echo "   Segmenter PID: $SEGMENTER_PID"
 
-# Give segmenter a moment to start
-sleep 2
+# # Give segmenter a moment to start
+# sleep 2
 
 # Start the web server
 echo "🌐 Starting Web Server at http://0.0.0.0:7860"

@@ -18,7 +18,7 @@ from io import BytesIO
 from pathlib import Path
 import time as time_module
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, Tuple
 from collections import defaultdict
 
 import cv2
@@ -534,92 +534,97 @@ class ParallelProcessor:
                 print(f"Broadcaster error: {e}")
                 await asyncio.sleep(1.0)
 
+    def _read_chunk_files(self, chunk: ChunkInfo) -> Tuple[List[str], np.ndarray]:
+        """Blocking helper that loads the video frames and prediction array."""
+        preds = np.load(chunk.pred_path)
+        cap = cv2.VideoCapture(str(chunk.video_path))
+        frames: List[str] = []
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            image_b64 = base64.b64encode(buffer).decode('utf-8')
+            frames.append(image_b64)
+
+        cap.release()
+        return frames, preds
+
     async def _load_chunk_to_buffer(self, timestamp: str):
         """Load video frames and prediction maps into RAM for high-efficiency broadcast"""
         all_chunks = chunk_manager.get_all()
         chunk = next((c for c in all_chunks if c.timestamp == timestamp), None)
-        if not chunk: return
-
-        print(f"📥 Loading chunk {timestamp} to RAM...")
-        
-        # Load predictions
-        try:
-            preds = np.load(chunk.pred_path)
-        except Exception as e:
-            print(f"Error loading predictions for {timestamp}: {e}")
+        if not chunk:
             return
 
-        # Load video frames
-        cap = cv2.VideoCapture(str(chunk.video_path))
-        frames = []
-        while True:
-            ok, frame = cap.read()
-            if not ok: break
-            
-            # Encode as JPEG and base64
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            image_b64 = base64.b64encode(buffer).decode('utf-8')
-            frames.append(image_b64)
-            if len(frames) % 50 == 0: await asyncio.sleep(0) # Yield
-        
-        cap.release()
-        
+        print(f"📥 Loading chunk {timestamp} to RAM...")
+
+        try:
+            frames, preds = await asyncio.to_thread(self._read_chunk_files, chunk)
+        except Exception as e:
+            print(f"Error loading chunk {timestamp}: {e}")
+            return
+
         with self._buffer_lock:
             self._broadcast_buffer = frames
             self._broadcast_preds = preds
-        
+
         print(f"⚡ RAM buffer ready: {len(frames)} frames for chunk {timestamp}")
 
     async def get_current_frame_data(self) -> Optional[Dict]:
         """Get the current frame data from RAM buffer for shared broadcast"""
+        idx = await broadcast_state.get_current_frame_idx()
+
         with self._buffer_lock:
-            if not self._broadcast_buffer: 
+            if not self._broadcast_buffer:
                 print("DEBUG: Broadcast buffer empty")
                 return None
-            
-            # Use global sync index
-            idx = await broadcast_state.get_current_frame_idx()
-            if idx >= len(self._broadcast_buffer):
-                idx = len(self._broadcast_buffer) - 1
-            if idx < 0: idx = 0
-            
-            image_b64 = self._broadcast_buffer[idx]
-            
-            # Handle missing predictions gracefully
-            pred_b64 = ""
-            pred_shape = [0, 0]
-            visible_stats = []
-            
-            if self._broadcast_preds is not None and idx < len(self._broadcast_preds):
-                pred_small = self._broadcast_preds[idx]
-                
-                # Update global stats for dashboards
-                stream_state.update_frame_stats(pred_small)
-                
-                # Get visible labels stats for WebSocket
-                for label, count in stream_state.frame_stats.items():
-                    if label in stream_state.active_labels:
-                        visible_stats.append({
-                            "label": label,
-                            "count": count,
-                            "color": color_map.get(label, "#FFF")
-                        })
-                visible_stats.sort(key=lambda x: x["count"], reverse=True)
-                
-                # Hover map encoding
-                pred_b64 = base64.b64encode(pred_small.tobytes()).decode('utf-8')
-                pred_shape = [pred_small.shape[0], pred_small.shape[1]]
-            
-            return {
-                "image": image_b64,
-                "pred_map": pred_b64,
-                "pred_shape": pred_shape,
-                "pred_scale": 4,
-                "fps": 15.0,
-                "avg_fps": 15.0,
-                "total_frames": idx,
-                "visible_labels": visible_stats[:8]
-            }
+
+            frames_snapshot = self._broadcast_buffer
+            preds_snapshot = self._broadcast_preds
+
+        if not frames_snapshot:
+            return None
+
+        if idx >= len(frames_snapshot):
+            idx = len(frames_snapshot) - 1
+        if idx < 0:
+            idx = 0
+
+        image_b64 = frames_snapshot[idx]
+        pred_b64 = ""
+        pred_shape = [0, 0]
+        visible_stats = []
+
+        if preds_snapshot is not None and idx < len(preds_snapshot):
+            pred_small = preds_snapshot[idx]
+
+            stream_state.update_frame_stats(pred_small)
+
+            for label, count in stream_state.frame_stats.items():
+                if label in stream_state.active_labels:
+                    visible_stats.append({
+                        "label": label,
+                        "count": count,
+                        "color": color_map.get(label, "#FFF")
+                    })
+            visible_stats.sort(key=lambda x: x["count"], reverse=True)
+
+            pred_b64 = base64.b64encode(pred_small.tobytes()).decode('utf-8')
+            pred_shape = [pred_small.shape[0], pred_small.shape[1]]
+
+        return {
+            "image": image_b64,
+            "pred_map": pred_b64,
+            "pred_shape": pred_shape,
+            "pred_scale": 4,
+            "fps": 15.0,
+            "avg_fps": 15.0,
+            "total_frames": idx,
+            "visible_labels": visible_stats[:8]
+        }
 
 parallel_processor = ParallelProcessor()
 
@@ -656,7 +661,7 @@ async def get_stats(period: str):
     return compute_period_mean(period)
 
 @app.get("/api/timeseries")
-async def get_timeseries(limit: int = Query(default=50), labels_limit: int = Query(default=5)):
+async def get_timeseries(limit: int = Query(default=200), labels_limit: int = Query(default=5)):
     """
     Get recent time-series data for line chart visualization.
     

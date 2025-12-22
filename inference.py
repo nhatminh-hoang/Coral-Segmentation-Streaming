@@ -293,7 +293,7 @@ class CoralSegModel:
             pred = cv2.resize(
                 small,
                 image.size,  # (W, H)
-                interpolation=cv2.INTER_NEAREST
+                interpolation=cv2.INTER_LINEAR
             )
             return pred
 
@@ -312,7 +312,7 @@ class CoralSegModel:
             outputs = self.model(pixel_values=pixel_values)
             logits = outputs.logits  # [1, C, h, w]
             preds = logits.argmax(dim=1)[0].to("cpu").numpy().astype(np.uint8)
-            pred = cv2.resize(preds, image.size, interpolation=cv2.INTER_NEAREST)
+            pred = cv2.resize(preds, image.size, interpolation=cv2.INTER_LINEAR)
             return pred
 
     @torch.inference_mode()
