@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CoralScapes Production Monitor</title>
     <meta name="description" content="Real-time coral reef segmentation streaming monitor">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="static/css/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 
@@ -15,7 +15,7 @@
         <!-- Header Bar -->
         <header class="header">
             <div class="header-left">
-                <h1 class="logo">🪸 CoralScapes Monitor</h1>
+                <h1 class="logo" id="logo-text">🪸 CoralScapes Monitor</h1>
                 <span class="connection-status" id="connection-status">
                     <span class="status-dot"></span>
                     <span class="status-text">Connecting...</span>
@@ -23,7 +23,7 @@
             </div>
             <div class="header-right">
                 <div class="fps-display" id="fps-display">
-                    <span class="fps-label">FPS:</span>
+                    <span class="fps-label" id="fps-label">FPS:</span>
                     <span class="fps-value" id="fps-value">--</span>
                 </div>
                 <button class="settings-btn" id="settings-btn" title="Settings">
@@ -42,7 +42,10 @@
             <!-- Streaming Display -->
             <section class="stream-section" id="stream-section">
                 <div class="section-header">
-                    <h2>🎬 Live Segmentation</h2>
+                    <h2 id="live-seg-title">
+                        🎬 Live Segmentation
+                        <span class="live-badge hidden" id="live-badge">LIVE</span>
+                    </h2>
                     <button class="fullscreen-btn" id="stream-fullscreen-btn" title="Toggle Fullscreen">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2">
@@ -57,7 +60,7 @@
                     <div class="stream-overlay" id="stream-overlay">
                         <div class="stream-placeholder">
                             <div class="spinner"></div>
-                            <p>Waiting for video stream...</p>
+                            <p id="stream-placeholder-text">Waiting for video stream...</p>
                         </div>
                     </div>
                     <div class="live-labels" id="live-labels"></div>
@@ -69,7 +72,7 @@
                 <!-- Time-Series Line Chart -->
                 <div class="timeseries-section">
                     <div class="timeseries-header">
-                        <h2>📈 Trends</h2>
+                        <h2 id="trends-title">📈 Trends</h2>
                         <button class="fullscreen-btn" id="timeseries-fullscreen-btn" title="Toggle Fullscreen">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                 stroke-width="2">
@@ -87,14 +90,14 @@
                 <!-- Statistics Chart -->
                 <div class="stats-section">
                     <div class="stats-header">
-                        <h2>📊 Statistics</h2>
+                        <h2 id="stats-title">📊 Statistics</h2>
                         <div class="stats-header-controls">
                             <div class="period-selector">
-                                <button class="period-btn active" data-period="day">Day</button>
-                                <button class="period-btn" data-period="week">Week</button>
-                                <button class="period-btn" data-period="month">Month</button>
-                                <button class="period-btn" data-period="3month">3M</button>
-                                <button class="period-btn" data-period="6month">6M</button>
+                                <button class="period-btn active" data-period="day" id="period-day">Day</button>
+                                <button class="period-btn" data-period="week" id="period-week">Week</button>
+                                <button class="period-btn" data-period="month" id="period-month">Month</button>
+                                <button class="period-btn" data-period="3month" id="period-3month">3M</button>
+                                <button class="period-btn" data-period="6month" id="period-6month">6M</button>
                             </div>
                             <button class="fullscreen-btn" id="stats-fullscreen-btn" title="Toggle Fullscreen">
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -116,25 +119,25 @@
         <!-- Settings Panel (Slide-in) -->
         <aside class="settings-panel" id="settings-panel">
             <div class="panel-header">
-                <h2>⚙️ Settings</h2>
+                <h2 id="settings-title">⚙️ Settings</h2>
                 <button class="close-btn" id="close-settings">×</button>
             </div>
             <div class="panel-content">
                 <!-- Camera URL Input -->
                 <div class="setting-group">
-                    <label for="camera-url">Camera/Stream URL</label>
+                    <label for="camera-url" id="camera-url-label">Camera/Stream URL</label>
                     <input type="text" id="camera-url" class="text-input" placeholder="rtsp://... or http://...">
                     <button class="apply-btn" id="apply-camera-url">Apply</button>
                 </div>
                 <div class="setting-group">
-                    <label for="skip-slider">Frame Skip (process every N frames)</label>
+                    <label for="skip-slider" id="skip-slider-label">Frame Skip (process every N frames)</label>
                     <div class="slider-container">
                         <input type="range" id="skip-slider" min="1" max="10" value="3">
                         <span class="slider-value" id="skip-value">3</span>
                     </div>
                 </div>
                 <div class="setting-group">
-                    <label>Language / Ngôn ngữ</label>
+                    <label id="language-label">Language / Ngôn ngữ</label>
                     <div class="radio-group">
                         <label class="radio-label">
                             <input type="radio" name="language" value="English">
@@ -149,7 +152,7 @@
                 <!-- Label Toggles -->
                 <div class="setting-group labels-setting">
                     <div class="labels-header">
-                        <label>🏷️ Label Filters</label>
+                        <label id="label-filters-title">🏷️ Label Filters</label>
                         <div class="label-actions">
                             <button class="label-action-btn" id="select-all">All</button>
                             <button class="label-action-btn" id="select-none">None</button>
@@ -167,7 +170,7 @@
         <div class="settings-overlay" id="settings-overlay"></div>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <script src="static/js/app.js"></script>
 </body>
 
 </html>

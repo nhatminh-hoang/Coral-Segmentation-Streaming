@@ -31,6 +31,65 @@ const AppState = {
         frameCount: 0,
         lastTime: performance.now(),
         value: 0
+    },
+    lastStatus: 'connecting'
+};
+
+// ==============================
+// Translations
+// ==============================
+const Translations = {
+    'English': {
+        'logo-text': '🪸 CoralScapes Monitor',
+        'fps-label': 'FPS:',
+        'live-seg-title': '🎬 Live Segmentation',
+        'stream-placeholder-text': 'Waiting for video stream...',
+        'trends-title': '📈 Trends',
+        'stats-title': '📊 Statistics',
+        'settings-title': '⚙️ Settings',
+        'camera-url-label': 'Camera/Stream URL',
+        'skip-slider-label': 'Frame Skip (process every N frames)',
+        'language-label': 'Language / Ngôn ngữ',
+        'label-filters-title': '🏷️ Label Filters',
+        'apply-camera-url': 'Apply',
+        'select-all': 'All',
+        'select-none': 'None',
+        'select-coral': 'Coral',
+        'period-day': 'Day',
+        'period-week': 'Week',
+        'period-month': 'Month',
+        'period-3month': '3M',
+        'period-6month': '6M',
+        'status-connected': 'Connected',
+        'status-disconnected': 'Disconnected',
+        'status-connecting': 'Connecting...',
+        'status-polling': 'Live (Polling)'
+    },
+    'Tiếng Việt': {
+        'logo-text': '🪸 CoralScapes Monitor',
+        'fps-label': 'FPS:',
+        'live-seg-title': '🎬 Phân đoạn Trực tiếp',
+        'stream-placeholder-text': 'Đang chờ luồng video...',
+        'trends-title': '📈 Xu hướng',
+        'stats-title': '📊 Thống kê',
+        'settings-title': '⚙️ Cài đặt',
+        'camera-url-label': 'URL Camera/Luồng',
+        'skip-slider-label': 'Bỏ qua khung hình (xử lý mỗi N khung hình)',
+        'language-label': 'Ngôn ngữ / Language',
+        'label-filters-title': '🏷️ Bộ lọc nhãn',
+        'apply-camera-url': 'Áp dụng',
+        'select-all': 'Tất cả',
+        'select-none': 'Không',
+        'select-coral': 'San hô',
+        'period-day': 'Ngày',
+        'period-week': 'Tuần',
+        'period-month': 'Tháng',
+        'period-3month': '3T',
+        'period-6month': '6T',
+        'status-connected': 'Đã kết nối',
+        'status-disconnected': 'Mất kết nối',
+        'status-connecting': 'Đang kết nối...',
+        'status-polling': 'Trực tiếp (Polling)'
     }
 };
 
@@ -63,7 +122,8 @@ const Elements = {
     selectAll: document.getElementById('select-all'),
     selectNone: document.getElementById('select-none'),
     selectCoral: document.getElementById('select-coral'),
-    periodBtns: document.querySelectorAll('.period-btn')
+    periodBtns: document.querySelectorAll('.period-btn'),
+    liveBadge: document.getElementById('live-badge')
 };
 
 // ==============================
@@ -92,16 +152,84 @@ async function init() {
     // Setup fullscreen toggle
     setupFullscreenToggle();
 
-    // Connect WebSocket
-    connectWebSocket();
+    // Start streaming via HTTP polling (faster and more reliable than WebSocket through proxies)
+    startPolling();
+
+    // Initial language UI update
+    updateLanguageUI();
+}
+
+// ==============================
+// UI Update Functions
+// ==============================
+function updateLanguageUI() {
+    console.log(`🌐 Switching UI language to: ${AppState.language}`);
+    const lang = AppState.language;
+    const translations = Translations[lang];
+
+    // Update simple text elements
+    for (const [id, text] of Object.entries(translations)) {
+        const el = document.getElementById(id);
+        if (el && !id.startsWith('status-')) { // Skip status translations handles separately
+            el.innerHTML = text;
+        }
+    }
+
+    // Refresh connection status text in new language
+    if (AppState.lastStatus) {
+        updateConnectionStatus(AppState.lastStatus);
+    }
+
+    // Update root lang attribute
+    document.documentElement.lang = lang === 'English' ? 'en' : 'vi';
+
+    // Rerender labels (since their names change)
+    renderLabelButtons();
+
+    // Update chart (if exists)
+    if (AppState.chart) {
+        loadStats(AppState.currentPeriod);
+    }
+    if (AppState.timeseriesChart) {
+        loadTimeseries();
+    }
 }
 
 // ==============================
 // API Functions
 // ==============================
+
+// Helper to handle relative paths with potential subpaths
+function getBaseUrl() {
+    const path = window.location.pathname;
+    // If path ends with slash, return it. Otherwise return path + slash.
+    return path.endsWith('/') ? path : path + '/';
+}
+
+// Wrapper for fetch to handle relative paths correctly
+async function apiFetch(endpoint) {
+    // endpoint should be like 'api/labels' (no leading slash)
+    const url = endpoint.startsWith('/') ? endpoint.substring(1) : endpoint;
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+    }
+    return response;
+}
+
+async function apiPost(endpoint, body) {
+    const url = endpoint.startsWith('/') ? endpoint.substring(1) : endpoint;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    return response;
+}
+
 async function loadLabels() {
     try {
-        const response = await fetch('/api/labels');
+        const response = await apiFetch('api/labels');
         const data = await response.json();
         AppState.labels = data.labels;
 
@@ -121,7 +249,7 @@ async function loadLabels() {
 
 async function loadStats(period) {
     try {
-        const response = await fetch(`/api/stats/${period}`);
+        const response = await apiFetch(`api/stats/${period}`);
         const data = await response.json();
         updateChart(data);
     } catch (error) {
@@ -131,7 +259,7 @@ async function loadStats(period) {
 
 async function toggleLabel(labelName) {
     try {
-        const response = await fetch(`/api/toggle_label/${encodeURIComponent(labelName)}`, {
+        const response = await fetch(`api/toggle_label/${encodeURIComponent(labelName)}`, {
             method: 'POST'
         });
         const data = await response.json();
@@ -163,9 +291,19 @@ async function toggleLabel(labelName) {
 // ==============================
 // WebSocket Connection
 // ==============================
+// ==============================
+// WebSocket & Polling Connection
+// ==============================
 function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
+
+    // Construct WS URL preserving the current path
+    let path = window.location.pathname;
+    if (!path.endsWith('/')) {
+        path += '/';
+    }
+
+    const wsUrl = `${protocol}//${window.location.host}${path}ws/stream`;
 
     console.log('Connecting to WebSocket:', wsUrl);
     updateConnectionStatus('connecting');
@@ -177,6 +315,10 @@ function connectWebSocket() {
         AppState.isConnected = true;
         AppState.reconnectAttempts = 0;
         updateConnectionStatus('online');
+        // Stop polling if active
+        if (AppState.pollActive) {
+            AppState.pollActive = false;
+        }
     };
 
     AppState.ws.onmessage = (event) => {
@@ -191,20 +333,88 @@ function connectWebSocket() {
     AppState.ws.onclose = () => {
         console.log('❌ WebSocket disconnected');
         AppState.isConnected = false;
-        updateConnectionStatus('offline');
 
         // Attempt reconnection
         if (AppState.reconnectAttempts < AppState.maxReconnectAttempts) {
             AppState.reconnectAttempts++;
             console.log(`Reconnecting... (attempt ${AppState.reconnectAttempts})`);
+            updateConnectionStatus('offline');
             setTimeout(connectWebSocket, 2000);
+        } else {
+            console.warn('Max reconnect attempts reached. Switching to HTTP polling.');
+            startPolling();
         }
     };
 
     AppState.ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        updateConnectionStatus('offline');
+        // Error will trigger onclose, handled there
     };
+}
+
+function startPolling() {
+    if (AppState.pollActive) return;
+
+    console.log('Starting HTTP polling fallback with client-side buffering...');
+    updateConnectionStatus('polling');
+
+    // Initialize buffering state
+    AppState.pollActive = true;
+    AppState.frameBuffer = [];           // Buffer of fetched frame data
+    AppState.bufferPlayIndex = 0;        // Index into the buffer for playback
+    AppState.fetchIndex = 0;             // Next frame index to fetch from server
+    AppState.totalServerFrames = 900;    // Will be updated from server response
+
+    const BUFFER_SIZE = 30;              // Keep 30 frames buffered (2 seconds at 15 FPS)
+    const TARGET_FPS = 15;
+    const FRAME_INTERVAL = 1000 / TARGET_FPS;  // ~66ms
+
+    // Fetcher loop - runs in background to fill the buffer
+    const fetcherLoop = async () => {
+        if (!AppState.pollActive) return;
+
+        // Only fetch if buffer is below target size
+        if (AppState.frameBuffer.length < BUFFER_SIZE) {
+            try {
+                const response = await apiFetch(`api/stream/frame?index=${AppState.fetchIndex}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    AppState.frameBuffer.push(data);
+
+                    // Update total frames from server
+                    if (data.total_frames > 0) {
+                        AppState.totalServerFrames = data.total_frames;
+                    }
+
+                    // Advance fetch index
+                    AppState.fetchIndex = (AppState.fetchIndex + 1) % AppState.totalServerFrames;
+                }
+            } catch (error) {
+                console.error('Buffer fetch error:', error);
+            }
+        }
+
+        // Schedule next fetch - run continuously but with a small delay
+        setTimeout(fetcherLoop, 10);
+    };
+
+    // Player loop - plays frames from the buffer at target FPS
+    const playerLoop = () => {
+        if (!AppState.pollActive) return;
+
+        if (AppState.frameBuffer.length > 0) {
+            // Pop the oldest frame from buffer and display it
+            const data = AppState.frameBuffer.shift();
+            handleWebSocketMessage(data);
+        }
+
+        // Schedule next frame at target FPS
+        setTimeout(playerLoop, FRAME_INTERVAL);
+    };
+
+    // Start both loops
+    fetcherLoop();
+    playerLoop();
 }
 
 function handleWebSocketMessage(data) {
@@ -213,6 +423,14 @@ function handleWebSocketMessage(data) {
             // Update stream image
             Elements.streamImage.src = `data:image/jpeg;base64,${data.image}`;
             Elements.streamOverlay.classList.add('hidden');
+
+            // Show streaming visual feedback
+            if (Elements.streamContainer) {
+                Elements.streamContainer.classList.add('streaming');
+            }
+            if (Elements.liveBadge) {
+                Elements.liveBadge.classList.remove('hidden');
+            }
 
             // Update real FPS (client-side measurement)
             updateRealFps();
@@ -255,6 +473,7 @@ function handleWebSocketMessage(data) {
 }
 
 function updateConnectionStatus(status) {
+    if (status) AppState.lastStatus = status;
     const statusDot = Elements.connectionStatus.querySelector('.status-dot');
     const statusText = Elements.connectionStatus.querySelector('.status-text');
 
@@ -263,14 +482,19 @@ function updateConnectionStatus(status) {
     switch (status) {
         case 'online':
             statusDot.classList.add('online');
-            statusText.textContent = 'Connected';
+            statusText.textContent = Translations[AppState.language]['status-connected'];
             break;
         case 'offline':
             statusDot.classList.add('offline');
-            statusText.textContent = 'Disconnected';
+            statusText.textContent = Translations[AppState.language]['status-disconnected'];
             break;
         case 'connecting':
-            statusText.textContent = 'Connecting...';
+            statusText.textContent = Translations[AppState.language]['status-connecting'];
+            break;
+        case 'polling':
+            statusDot.classList.add('online');  // Reuse online color (green) or maybe add a yellow one?
+            // Let's keep it green but indicate mode
+            statusText.textContent = Translations[AppState.language]['status-polling'];
             break;
     }
 }
@@ -637,7 +861,7 @@ function initTimeseriesChart() {
 
 async function loadTimeseries() {
     try {
-        const response = await fetch('/api/timeseries?limit=50&labels_limit=20');
+        const response = await apiFetch('api/timeseries?limit=50&labels_limit=20');
         const data = await response.json();
         updateTimeseriesChart(data);
     } catch (error) {
@@ -740,8 +964,7 @@ function setupEventListeners() {
     document.querySelectorAll('input[name="language"]').forEach(radio => {
         radio.addEventListener('change', (e) => {
             AppState.language = e.target.value;
-            renderLabelButtons();
-            loadStats(AppState.currentPeriod);
+            updateLanguageUI();
         });
     });
 
@@ -790,11 +1013,7 @@ async function selectAllLabels(active) {
     });
 
     try {
-        await fetch('/api/set_labels', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(labels)
-        });
+        await apiPost('api/set_labels', labels);
         renderLabelButtons();
 
         // Refresh charts to apply filter
@@ -826,17 +1045,14 @@ function selectCoralLabels() {
         labels[label.name] = AppState.activeLabels.has(label.name);
     });
 
-    fetch('/api/set_labels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(labels)
-    }).then(() => {
-        renderLabelButtons();
-
-        // Refresh charts to apply filter
-        loadStats(AppState.currentPeriod);
-        loadTimeseries();
-    });
+    // UPDATED: Use apiPost to ensure relative path
+    apiPost('api/set_labels', labels)
+        .then(() => {
+            renderLabelButtons();
+            // Refresh charts to apply filter
+            loadStats(AppState.currentPeriod);
+            loadTimeseries();
+        });
 }
 
 // ==============================
@@ -1005,7 +1221,7 @@ function setupCameraUrlHandler() {
             const url = Elements.cameraUrl.value.trim();
 
             try {
-                await fetch(`/api/camera_url?url=${encodeURIComponent(url)}`, {
+                await fetch(`api/camera_url?url=${encodeURIComponent(url)}`, {
                     method: 'POST'
                 });
 

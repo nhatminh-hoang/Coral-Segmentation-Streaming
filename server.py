@@ -573,9 +573,13 @@ class ParallelProcessor:
 
         print(f"⚡ RAM buffer ready: {len(frames)} frames for chunk {timestamp}")
 
-    async def get_current_frame_data(self) -> Optional[Dict]:
+    async def get_current_frame_data(self, requested_idx: Optional[int] = None) -> Optional[Dict]:
         """Get the current frame data from RAM buffer for shared broadcast"""
-        idx = await broadcast_state.get_current_frame_idx()
+        # If specific index requested, use it; otherwise sync with global clock
+        if requested_idx is not None:
+            idx = requested_idx
+        else:
+            idx = await broadcast_state.get_current_frame_idx()
 
         with self._buffer_lock:
             if not self._broadcast_buffer:
@@ -588,8 +592,11 @@ class ParallelProcessor:
         if not frames_snapshot:
             return None
 
+        # Handle index bounds (looping or clamping)
         if idx >= len(frames_snapshot):
-            idx = len(frames_snapshot) - 1
+            # For client playback, if we hit the end, we loop or clamp?
+            # Let's wrap around for continuous playback effect
+            idx = idx % len(frames_snapshot)
         if idx < 0:
             idx = 0
 
@@ -622,7 +629,7 @@ class ParallelProcessor:
             "pred_scale": 4,
             "fps": 15.0,
             "avg_fps": 15.0,
-            "total_frames": idx,
+            "total_frames": len(frames_snapshot),
             "visible_labels": visible_stats[:8]
         }
 
@@ -798,11 +805,9 @@ async def shutdown_event():
 # ==============================
 # WEBSOCKET STREAMING (Cache-based)
 # ==============================
-@app.websocket("/ws/stream")
-async def websocket_stream(websocket: WebSocket):
+async def stream_handler(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time video streaming.
-    
+    Shared handler for WebSocket streaming.
     Clients receive frames from the shared RAM buffer managed by 
     the broadcaster. All clients are synchronized to the global clock.
     """
@@ -854,6 +859,43 @@ async def websocket_stream(websocket: WebSocket):
         print("❌ WebSocket client disconnected")
     except Exception as e:
         print(f"WebSocket error: {e}")
+
+@app.get("/api/stream/frame")
+async def get_current_frame(index: Optional[int] = Query(None)):
+    """
+    HTTP endpoint for frame polling (fallback for when WebSocket fails).
+    Returns the current frame data as JSON.
+    If 'index' is provided, returns the specific frame from the current chunk.
+    """
+    try:
+        # Get data from RAM buffer
+        fdata = await parallel_processor.get_current_frame_data(requested_idx=index)
+        
+        if fdata:
+            return JSONResponse({
+                "type": "frame",
+                "image": fdata["image"],
+                "fps": fdata["fps"],
+                "avg_fps": fdata["avg_fps"],
+                "total_frames": fdata["total_frames"],
+                "visible_labels": fdata["visible_labels"],
+                "pred_map": fdata["pred_map"],
+                "pred_shape": fdata["pred_shape"],
+                "pred_scale": fdata["pred_scale"]
+            })
+        else:
+            return JSONResponse({"type": "status", "message": "No frame available"}, status_code=503)
+    except Exception as e:
+        return JSONResponse({"type": "error", "message": str(e)}, status_code=500)
+
+@app.websocket("/ws/stream")
+async def websocket_stream_root(websocket: WebSocket):
+    await stream_handler(websocket)
+
+@app.websocket("/ai/segment/ws/stream")
+async def websocket_stream_proxy(websocket: WebSocket):
+    print("✅ Proxy connection received on /ai/segment/ws/stream")
+    await stream_handler(websocket)
 
 # ==============================
 # MAIN

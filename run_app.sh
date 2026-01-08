@@ -6,23 +6,24 @@ echo "=============================================="
 echo "🪸 CoralScapes Production Monitor"
 echo "=============================================="
 
-# Create chunks directory if it doesn't exist
 mkdir -p chunks
 
-# Start the segmenter worker in the background
+# 1. Define cleanup function
+cleanup() {
+    echo "🛑 Stopping Segmenter Worker..."
+    kill $SEGMENTER_PID 2>/dev/null
+    echo "✅ All processes stopped."
+}
+
+# 2. Trap signals (INT=Ctrl+C, TERM=kill command, EXIT=script exit)
+trap cleanup INT TERM EXIT
+
 echo "🔨 Starting Segmenter Worker (background process)..."
 python segmenter_worker.py &
 SEGMENTER_PID=$!
 echo "   Segmenter PID: $SEGMENTER_PID"
 
-# # Give segmenter a moment to start
-# sleep 2
-
-# Start the web server
 echo "🌐 Starting Web Server at http://0.0.0.0:7860"
 python server.py
 
-# Cleanup: kill segmenter when server stops
-echo "🛑 Stopping Segmenter Worker..."
-kill $SEGMENTER_PID 2>/dev/null
-echo "✅ All processes stopped."
+# No need for manual cleanup at the bottom; the 'trap' handles it automatically when server.py exits.
